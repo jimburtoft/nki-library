@@ -72,6 +72,7 @@ def router_topk(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
+    expert_bias: nl.ndarray = None,
 ):
     """
     Router top-K kernel for Mixture of Experts (MoE) models.
@@ -114,6 +115,13 @@ def router_topk(
         shard_on_tokens (bool): Enable LNC sharding across token dimension
         skip_store_expert_index (bool): Skip storing expert indices to HBM
         skip_store_router_logits (bool): Skip storing router logits to HBM
+        expert_bias (nl.ndarray): Optional expert selection bias [1, E] or [E] in HBM.
+            When provided with ACT1 pipeline (router_pre_norm=True), the bias is added
+            to expert affinities ONLY for top-K selection. The actual routing weights
+            (scattered expert_affinities) remain unbiased. This supports models like
+            Trinity that use post-activation additive bias for expert selection:
+                selection_scores = sigmoid(logits) + expert_bias  # for top-K
+                routing_weights = sigmoid(logits)[top_k_indices]  # no bias
 
     Returns:
         outputs (list): [router_logits, expert_index, expert_affinities, optional: expert_affinities_topk]
@@ -569,6 +577,38 @@ def router_topk(
     Select input for topK operation. If ACT1 is enabled, use its output. Otherwise use router-logits.
     """
     topk_input_sb = router_logits_sb if (not pipeline_enable_act1) else expert_affinities_full_sb
+
+    """expert_bias -- Post-activation additive bias for top-K selection only.
+    
+    When expert_bias is provided and ACT1 is enabled (sigmoid/softmax already applied),
+    we add expert_bias to the activation output to create a biased copy for top-K selection.
+    The unbiased expert_affinities_full_sb is preserved for the scatter path, ensuring that
+    actual routing weights remain unbiased.
+    
+    This supports models like Trinity where expert_bias influences WHICH experts are selected
+    but does NOT affect the routing weight values.
+    """
+    has_expert_bias = expert_bias != None
+    if has_expert_bias and pipeline_enable_act1:
+        expert_bias = expert_bias.reshape((1, E))
+        # Load expert_bias from HBM to SBUF, following the same pattern as w_bias
+        expert_bias_vector_sb = nl.ndarray((1, E), dtype=nl.float32, buffer=nl.sbuf, name='expert_bias_sb')
+        expert_bias_broadcasted_sb = nl.ndarray(shape=(t_tile_size, E), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(
+            dst=tensor_view.TensorView(expert_bias_vector_sb).get_view(),
+            src=tensor_view.TensorView(expert_bias).get_view(),
+        )
+        stream_shuffle_broadcast.stream_shuffle_broadcast(expert_bias_vector_sb, expert_bias_broadcasted_sb)
+
+        # Create biased copy for top-K selection; original expert_affinities_full_sb stays unbiased
+        topk_input_sb = nl.ndarray((t_p_dim, num_t_tiles, E), dtype=nl.float32, buffer=nl.sbuf)
+        for t_tile in tiled_range.TiledRange(T_local, ST_F_MAX):
+            nisa.tensor_tensor(
+                dst=topk_input_sb[: t_tile.size, t_tile.index, :],
+                data1=expert_affinities_full_sb[: t_tile.size, t_tile.index, :],
+                data2=expert_bias_broadcasted_sb[: t_tile.size, :E],
+                op=nl.add,
+            )
 
     # Simplify by setting max K=8.
     kernel_assert(k >= 1, f"K ({k}) must be >= 1")
