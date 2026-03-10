@@ -132,7 +132,8 @@ Kernel constraints (based on tested range, values outside range might work in pr
 _MAX_BS = 512  # max tested batch size
 _MAX_SEQLEN = 131072  # max allowed seqlen
 _MAX_BS_TIMES_SEQLEN_QK = 32.0 * 36864 * 36864  # max tested bs*seqlen_q*seqlen_k
-_MAX_HEAD_DIM = 128  # max supported head dim (d)
+_MAX_HEAD_DIM = 256  # max supported head dim (d)
+_PAR_DIM_MAX = 128  # hardware partition dimension max (nl.tile_size.pmax)
 _MIN_GLOBAL_CP_DEGREE = 1  # minimum context parallel degree
 _MAX_GLOBAL_CP_DEGREE = 32  # minimum context parallel degree
 
@@ -155,6 +156,16 @@ _FLASH_ATTENTION_SECTION_LENGTH = 8 * 1024  # Section size when using flash atte
 _SWA_ALLOCATION_STRATEGY_THRESHOLD = (
     128  # for SWA, threshold above which allocate more q tiles and use range_select masking
 )
+
+
+def _num_d_chunks(d: int) -> int:
+    """Return the number of chunks needed to tile head_dim d into _PAR_DIM_MAX-sized pieces."""
+    return div_ceil(d, _PAR_DIM_MAX)
+
+
+def _d_par_size(d: int) -> int:
+    """Return the partition dimension size for buffers, capped at _PAR_DIM_MAX."""
+    return min(d, _PAR_DIM_MAX)
 
 
 @nki.jit
@@ -376,6 +387,13 @@ def attention_cte(
         d <= _MAX_HEAD_DIM,
         f"we do not support head_dim > {_MAX_HEAD_DIM}, got head dim {d}",
     )
+    # tp_out with d > _PAR_DIM_MAX not yet supported (would require tiling d on par_dim
+    # in MM2, flash attn correction, and output write-back paths)
+    if d > _PAR_DIM_MAX:
+        kernel_assert(
+            not tp_out,
+            f"tp_out=True is not supported for head_dim > {_PAR_DIM_MAX}, got head dim {d}. Use tp_out=False instead.",
+        )
 
     # Context parallel
     if global_cp_deg:
@@ -391,6 +409,8 @@ def attention_cte(
         seqlen_k_active=seqlen_k_active,
         seqlen_k_prior=seqlen_k_prior,
         d=d,
+        d_par=_d_par_size(d),
+        num_d_chunks=_num_d_chunks(d),
         tp_q=tp_q,
         tp_k=tp_k,
         tp_out=tp_out,
@@ -515,6 +535,10 @@ class AttnConfig(nl.NKIObject):
     seqlen_k_active: int = None
     seqlen_k_prior: int = None
     d: int = None
+
+    # Head dim tiling for d > _PAR_DIM_MAX (128)
+    d_par: int = None  # min(d, _PAR_DIM_MAX) -- par_dim size for Q/K buffers
+    num_d_chunks: int = None  # ceil(d / _PAR_DIM_MAX) -- number of d-chunks for MM1
 
     # Transpose flags
     tp_q: bool = None
@@ -661,18 +685,21 @@ def _attention_cte_impl(
         sbuf_addr = allocator.get_current_address()
 
         # Load K and V for the section
-        sbuf_addr = _load_k_tile(
-            k_active,
-            k_prior,
-            bufs.k_sb,
-            batch_id_kv,
-            sp,
-            nl.bfloat16,
-            ac.tp_k,
-            atp.num_k_tiles_per_section,
-            sbuf_addr,
-            load_offset_active=bufs.k_offset_sb_u32,
-        )
+        for d_chunk_idx in range(ac.num_d_chunks):
+            sbuf_addr = _load_k_tile(
+                k_active,
+                k_prior,
+                bufs.k_sb[d_chunk_idx],
+                batch_id_kv,
+                sp,
+                nl.bfloat16,
+                ac.tp_k,
+                atp.num_k_tiles_per_section,
+                sbuf_addr,
+                load_offset_active=bufs.k_offset_sb_u32,
+                d_chunk_idx=d_chunk_idx,
+                d_full=ac.d,
+            )
         sbuf_addr = _load_v_tile(
             v_active,
             v_prior,
@@ -1185,12 +1212,15 @@ def _allocate_attention_buffers(
     mm1_p, mm1_n = atp.sb_p, nl.tile_size.psum_fmax
     mm2_p, mm2_n = atp.sb_p, ac.d
 
-    p_k, n_k = ac.d, _K_TILE_SZ  # d is reduction dim for MM1
+    # For MM1, d is the reduction dim. When d > _PAR_DIM_MAX, we tile d into chunks.
+    # K and Q buffers use d_par (= min(d, _PAR_DIM_MAX)) on par_dim, with extra
+    # block_dim entries for each d-chunk.
+    p_k, n_k = ac.d_par, _K_TILE_SZ  # d_par is reduction dim for MM1 (per chunk)
     bufs.k_sb = allocator.alloc_sbuf_tensor(
         shape=(p_k, n_k),
         dtype=nl.bfloat16,
-        block_dim=[atp.num_k_tiles_per_section],
-        num_free_tiles=[atp.num_k_tiles_per_section],
+        block_dim=[ac.num_d_chunks, atp.num_k_tiles_per_section],
+        num_free_tiles=[ac.num_d_chunks, atp.num_k_tiles_per_section],
         align_to=32,  # align for dma transpose
     )
 
@@ -1203,10 +1233,10 @@ def _allocate_attention_buffers(
     )
 
     bufs.q_sb = allocator.alloc_sbuf_tensor(
-        shape=(ac.d, atp.sb_p * atp.num_q_grps_per_load),
+        shape=(ac.d_par, atp.sb_p * atp.num_q_grps_per_load),
         dtype=nl.bfloat16,
-        block_dim=[div_ceil(atp.num_grps, atp.num_q_grps_per_load)],
-        num_free_tiles=[2],
+        block_dim=[ac.num_d_chunks, div_ceil(atp.num_grps, atp.num_q_grps_per_load)],
+        num_free_tiles=[ac.num_d_chunks, 2],
         align_to=32,  # align for dma transpose
     )
 
@@ -1543,19 +1573,29 @@ def _check_input_and_return_shape(
     return (seqlen_q, seqlen_k, seqlen_k_prior, d, out_shape, cache_softmax_shape)
 
 
-def _load_q_tile(q, out, tp_q, batch_id, grp_i, seqlen_offset, load_dtype, sbuf_addr, grps_per_load=1) -> int:
+def _load_q_tile(
+    q, out, tp_q, batch_id, grp_i, seqlen_offset, load_dtype, sbuf_addr, grps_per_load=1, d_chunk_idx=0, d_par=None
+) -> int:
     """Load Q tile from HBM to SBUF, handling transpose based on tp_q flag.
 
     When tp_q is True, assumes q = (bs, seqlen, d).
-
     When tp_q is False, assumes q = (bs, d, seqlen), will perform transpose then save into out.
 
-    out[grp_i // grps_per_load] has shape (d, 128 * grps_per_load)
+    out[grp_i // grps_per_load] has shape (d_par, 128 * grps_per_load)
+
+    When d > _PAR_DIM_MAX, d_chunk_idx selects which chunk of head_dim to load:
+      d_chunk_idx=0 loads d[0:d_par], d_chunk_idx=1 loads d[d_par:2*d_par], etc.
     """
     kernel_assert(str(load_dtype) == str(out[0].dtype), "Conflicting dtype")
     local_allocator = ModularAllocator(initial_address=sbuf_addr)
+
     if tp_q:
         _, seqlen, d = q.shape
+        if d_par is None:
+            d_par = d
+        d_offset = d_chunk_idx * _PAR_DIM_MAX
+        d_chunk_size = min(d_par, d - d_offset)
+
         if grps_per_load > 1:
             # Use DMA transpose
             num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ * grps_per_load)
@@ -1563,25 +1603,27 @@ def _load_q_tile(q, out, tp_q, batch_id, grp_i, seqlen_offset, load_dtype, sbuf_
             # TODO: fix below check once proper type is available for tensor dtype
             if str(q.dtype) == str(nl.bfloat16):
                 nisa.dma_transpose(
-                    dst=out[grp_i // grps_per_load].ap([[_Q_GRP_SZ * grps_per_load, d], [1, 1], [1, 1], [1, num_p]]),
+                    dst=out[grp_i // grps_per_load].ap(
+                        [[_Q_GRP_SZ * grps_per_load, d_chunk_size], [1, 1], [1, 1], [1, num_p]]
+                    ),
                     src=q.ap(
-                        [[d, num_p], [1, 1], [1, 1], [1, d]],
-                        offset=batch_id * seqlen * d + seqlen_offset * d,
+                        [[d_chunk_size, num_p], [1, 1], [1, 1], [1, d]],
+                        offset=batch_id * seqlen * d + seqlen_offset * d + d_offset,
                     ),
                 )
             else:
                 # Need a buffer with same dtype as q as dma_transpose requires same I/O dtype
                 buffer = local_allocator.alloc_sbuf_tensor(
-                    shape=(d, _Q_GRP_SZ * grps_per_load),
+                    shape=(d_chunk_size, _Q_GRP_SZ * grps_per_load),
                     dtype=q.dtype,
                     align_to=32,  # align for dma transpose
                 )
 
                 nisa.dma_transpose(
-                    dst=buffer.ap([[_Q_GRP_SZ * grps_per_load, d], [1, 1], [1, 1], [1, num_p]]),
+                    dst=buffer.ap([[_Q_GRP_SZ * grps_per_load, d_chunk_size], [1, 1], [1, 1], [1, num_p]]),
                     src=q.ap(
-                        [[d, num_p], [1, 1], [1, 1], [1, d]],
-                        offset=batch_id * seqlen * d + seqlen_offset * d,
+                        [[d_chunk_size, num_p], [1, 1], [1, 1], [1, d]],
+                        offset=batch_id * seqlen * d + seqlen_offset * d + d_offset,
                     ),
                 )
 
@@ -1592,39 +1634,37 @@ def _load_q_tile(q, out, tp_q, batch_id, grp_i, seqlen_offset, load_dtype, sbuf_
                 grps_per_load == 1,
                 "tp Q on Trn1/shard on seqlen does not yet support packed load",
             )
-            loaded = local_allocator.alloc_sbuf_tensor(shape=(_Q_GRP_SZ, d), dtype=load_dtype)
+            loaded = local_allocator.alloc_sbuf_tensor(shape=(_Q_GRP_SZ, d_chunk_size), dtype=load_dtype)
             tp_dt = load_dtype
-            psum_buf = nl.ndarray((d, _Q_GRP_SZ), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
+            psum_buf = nl.ndarray((d_chunk_size, _Q_GRP_SZ), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
 
             num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ)
-            # Convert load() to access pattern
-            # Original: load(dst=loaded[nl.ds(0, num_p), :], src=q[batch_id, nl.ds(seqlen_offset, _Q_GRP_SZ), 0:d], dtype=load_dtype)
-            # q shape: (bs, seqlen, d), accessing q[batch_id, seqlen_offset:seqlen_offset+_Q_GRP_SZ, 0:d]
-            # Pattern: [[d, num_p], [1, d]]
-            # Offset: batch_id*seqlen*d + seqlen_offset*d
-            loaded_dst_pat = loaded.ap(pattern=[[d, num_p], [1, d]], offset=0)
+            # q shape: (bs, seqlen, d), load chunk d[d_offset:d_offset+d_chunk_size]
+            loaded_dst_pat = loaded.ap(pattern=[[d_chunk_size, num_p], [1, d_chunk_size]], offset=0)
             q_src_pat = q.ap(
-                pattern=[[d, num_p], [1, d]],
-                offset=batch_id * seqlen * d + seqlen_offset * d,
+                pattern=[[d_chunk_size, num_p], [1, d]],
+                offset=batch_id * seqlen * d + seqlen_offset * d + d_offset,
             )
             nisa.dma_copy(dst=loaded_dst_pat, src=q_src_pat)
 
-            nisa.nc_transpose(psum_buf[:d, :num_p], loaded[:num_p, :d])
+            nisa.nc_transpose(psum_buf[:d_chunk_size, :num_p], loaded[:num_p, :d_chunk_size])
             num_f = min(seqlen - seqlen_offset, _Q_GRP_SZ)
-            nisa.tensor_copy(out[grp_i][:d, :num_f], psum_buf[:d, :num_f])
+            nisa.tensor_copy(out[grp_i][:d_chunk_size, :num_f], psum_buf[:d_chunk_size, :num_f])
     else:
         _, d, seqlen = q.shape
+        if d_par is None:
+            d_par = d
+        d_offset = d_chunk_idx * _PAR_DIM_MAX
+        d_chunk_size = min(d_par, d - d_offset)
 
         num_f = min(seqlen - seqlen_offset, _Q_GRP_SZ * grps_per_load)
-        # Convert load() to access pattern
-        # Original: load(dst=out[grp_i // grps_per_load][nl.ds(0, d), nl.ds(0, num_f)], src=q[batch_id, nl.ds(0, d), nl.ds(seqlen_offset, num_f)], dtype=load_dtype)
-        # q shape: (bs, d, seqlen), accessing q[batch_id, 0:d, seqlen_offset:seqlen_offset+num_f]
-        # Pattern: [[seqlen, d], [1, num_f]]
-        # Offset: batch_id*d*seqlen + seqlen_offset
-        out_dst_pat = out[grp_i // grps_per_load].ap(pattern=[[_Q_GRP_SZ * grps_per_load, d], [1, num_f]], offset=0)
+        # q shape: (bs, d, seqlen), load rows d[d_offset:d_offset+d_chunk_size]
+        out_dst_pat = out[grp_i // grps_per_load].ap(
+            pattern=[[_Q_GRP_SZ * grps_per_load, d_chunk_size], [1, num_f]], offset=0
+        )
         q_src_pat = q.ap(
-            pattern=[[seqlen, d], [1, num_f]],
-            offset=batch_id * d * seqlen + seqlen_offset,
+            pattern=[[seqlen, d_chunk_size], [1, num_f]],
+            offset=batch_id * d * seqlen + d_offset * seqlen + seqlen_offset,
         )
         nisa.dma_copy(dst=out_dst_pat, src=q_src_pat)
 
@@ -1673,6 +1713,8 @@ def _load_k_tile(
     num_tiles,
     sbuf_addr,
     load_offset_active=None,
+    d_chunk_idx=0,
+    d_full=None,
 ) -> int:
     """Load K tiles from HBM to SBUF in _K_TILE_SZ (512)-element chunks, handling transpose and prefix caching.
 
@@ -1680,7 +1722,10 @@ def _load_k_tile(
      (bs, d, seqlen) when tp_k=False
      (bs, seqlen, d) when tp_k=True, i.e. a transpose is performed
     k_prior (if passed) has shape identical to k except for the seqlen.
-    Return shape of out[i] is (d, _K_TILE_SIZE) where i = 0..num_k_tiles_per_section
+    Return shape of out[i] is (d_par, _K_TILE_SIZE) where d_par = min(d, _PAR_DIM_MAX), i = 0..num_k_tiles_per_section
+
+    When d > _PAR_DIM_MAX, d_chunk_idx selects which chunk of head_dim to load.
+    d_full is the full head_dim (needed to compute correct HBM offsets).
     """
     if tp_k:
         _, seqlen_active, _ = k_active.shape
@@ -1694,9 +1739,13 @@ def _load_k_tile(
         else:
             _, _, seqlen_prior = k_prior.shape
     if num_tiles > 0:
-        d, n = out[0].shape
+        d, n = out[0].shape  # d is d_par (possibly < d_full when tiling head_dim)
     sb_p = nl.tile_size.pmax
     stride_f = _K_TILE_SZ
+    # d_full is the actual head_dim in HBM (may differ from d when d > _PAR_DIM_MAX)
+    if d_full is None:
+        d_full = d if num_tiles > 0 else 0
+    d_offset = d_chunk_idx * _PAR_DIM_MAX
 
     kernel_assert(n == _K_TILE_SZ, f"expect to load in tile of size {_K_TILE_SZ=}")
     kernel_assert(str(load_dtype) == str(out[0].dtype), "load dtype mismatch")
@@ -1731,8 +1780,8 @@ def _load_k_tile(
                     nisa.dma_transpose(
                         dst=out[tile].ap([[n, d], [1, 1], [1, 1], [1, num_p]]),
                         src=k.ap(
-                            [[d, num_p], [1, 1], [1, 1], [1, d]],
-                            offset=batch_id * seqlen * d + seqlen_offset * d,
+                            [[d, num_p], [1, 1], [1, 1], [1, d_full]],
+                            offset=batch_id * seqlen * d_full + seqlen_offset * d_full + d_offset,
                         ),
                     )
                 else:
@@ -1746,8 +1795,8 @@ def _load_k_tile(
                     nisa.dma_transpose(
                         dst=buffer.ap([[n, d], [1, 1], [1, 1], [1, num_p]]),
                         src=k.ap(
-                            [[d, num_p], [1, 1], [1, 1], [1, d]],
-                            offset=batch_id * seqlen * d + seqlen_offset * d,
+                            [[d, num_p], [1, 1], [1, 1], [1, d_full]],
+                            offset=batch_id * seqlen * d_full + seqlen_offset * d_full + d_offset,
                         ),
                     )
 
@@ -1778,9 +1827,9 @@ def _load_k_tile(
                                 offset=tp_idx * d,
                             )
                             k_src_pat = k.ap(
-                                pattern=[[d, num_p], [1, d]],
+                                pattern=[[d, num_p], [1, d_full]],
                                 scalar_offset=ind_offset,
-                                offset=batch_id * seqlen * d,
+                                offset=batch_id * seqlen * d_full + d_offset,
                                 indirect_dim=1,
                             )
                             nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
@@ -1790,10 +1839,8 @@ def _load_k_tile(
                     num_p = min(seqlen - seqlen_offset - num_inner_f * num_pe_tps, sb_p)
 
                     # Convert load() to access pattern with 2D mask
-                    # Original: load(dst=loaded[...], src=k[batch_id, seqlen_offset + i_b*128 + i_p, i_f], mask=i_b*128+i_p < seqlen-seqlen_offset)
                     if seqlen_offset < seqlen:
                         # case 1: handle rectangular
-                        # Offset: batch_id*seqlen*d + seqlen_offset*d
                         num_inner_f = min(num_pe_tps, (seqlen - seqlen_offset) // sb_p)
                         num_p = sb_p
                         loaded_dst_pat = loaded.ap(
@@ -1802,8 +1849,8 @@ def _load_k_tile(
                         )
 
                         k_src_pat = k.ap(
-                            pattern=[[d, num_p], [d * sb_p, num_inner_f], [1, d]],
-                            offset=batch_id * seqlen * d + seqlen_offset * d,
+                            pattern=[[d, num_p], [d_full * sb_p, num_inner_f], [1, d_full]],
+                            offset=batch_id * seqlen * d_full + seqlen_offset * d_full + d_offset,
                         )
                         nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
                         # case 2: handle last row
@@ -1812,12 +1859,17 @@ def _load_k_tile(
                                 sb_p,
                                 seqlen - seqlen_offset - (seqlen - seqlen_offset) // sb_p * sb_p,
                             )
-                            offset = batch_id * seqlen * d + seqlen_offset * d + num_inner_f * sb_p * d
+                            offset = (
+                                batch_id * seqlen * d_full
+                                + seqlen_offset * d_full
+                                + num_inner_f * sb_p * d_full
+                                + d_offset
+                            )
                             loaded_dst_pat = loaded.ap(
                                 pattern=[[num_pe_tps * d, num_p], [1, d]],
                                 offset=num_inner_f * d,
                             )
-                            k_src_pat = k.ap(pattern=[[d, num_p], [1, d]], offset=offset)
+                            k_src_pat = k.ap(pattern=[[d, num_p], [1, d_full]], offset=offset)
                             nisa.dma_copy(dst=loaded_dst_pat, src=k_src_pat)
 
                 if seqlen_offset < seqlen:
@@ -1861,20 +1913,16 @@ def _load_k_tile(
                     k_src_pat = k.ap(
                         pattern=[[seqlen, d], [1, num_f]],
                         scalar_offset=ind_offset,
-                        offset=batch_id * d * seqlen,
+                        offset=batch_id * d_full * seqlen + d_offset * seqlen,
                         indirect_dim=2,
                     )
                     nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
                 else:
-                    # Convert load() to access pattern
-                    # Original: load(dst=out[i][nl.ds(0, d), nl.ds(0, num_f)], src=k[batch_id, nl.ds(0, d), nl.ds(seqlen_offset, num_f)], dtype=load_dtype)
-                    # k shape: (bs, d, seqlen), accessing k[batch_id, 0:d, seqlen_offset:seqlen_offset+num_f]
-                    # Pattern: [[seqlen, d], [1, num_f]]
-                    # Offset: batch_id*d*seqlen + seqlen_offset
+                    # k shape: (bs, d_full, seqlen), load rows d[d_offset:d_offset+d] of seqlen[seqlen_offset:seqlen_offset+num_f]
                     out_dst_pat = out[tile].ap(pattern=[[stride_f, d], [1, num_f]], offset=0)
                     k_src_pat = k.ap(
                         pattern=[[seqlen, d], [1, num_f]],
-                        offset=batch_id * d * seqlen + seqlen_offset,
+                        offset=batch_id * d_full * seqlen + d_offset * seqlen + seqlen_offset,
                     )
 
                     nisa.dma_copy(dst=out_dst_pat, src=k_src_pat)
@@ -1986,17 +2034,20 @@ def _load_q_impl(
         )
         if has_any_compute_pred:
             q_seqlen_offset = grp_i * _Q_GRP_SZ
-            _load_q_tile(
-                q,
-                bufs.q_sb,
-                ac.tp_q,
-                batch_id,
-                grp_i,
-                q_seqlen_offset,
-                bufs.q_sb[0].dtype,
-                sbuf_addr,
-                grps_per_load=atp.num_q_grps_per_load,
-            )
+            for d_chunk_idx in range(ac.num_d_chunks):
+                _load_q_tile(
+                    q,
+                    bufs.q_sb[d_chunk_idx],
+                    ac.tp_q,
+                    batch_id,
+                    grp_i,
+                    q_seqlen_offset,
+                    bufs.q_sb[0][0].dtype,
+                    sbuf_addr,
+                    grps_per_load=atp.num_q_grps_per_load,
+                    d_chunk_idx=d_chunk_idx,
+                    d_par=ac.d_par,
+                )
 
 
 def _qk_and_max_impl(
@@ -2562,15 +2613,16 @@ def _qk_and_max_large_tile_impl(
             num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
             num_q_free = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
 
-            # Step 1: MM1 matmul
-            nisa.nc_matmul(
-                mm1_psum_tile[:num_q_free, :num_f],
-                bufs.q_sb[qkmax_grp // atp.num_q_grps_per_load][
-                    : ac.d,
-                    nl.ds((qkmax_grp % atp.num_q_grps_per_load) * _Q_GRP_SZ, num_q_free),
-                ],
-                bufs.k_sb[k_tile_idx_in_section][:, :num_f],
-            )
+            # Step 1: MM1 matmul (tiled over d-chunks for head_dim > _PAR_DIM_MAX)
+            for d_chunk_idx in range(ac.num_d_chunks):
+                nisa.nc_matmul(
+                    mm1_psum_tile[:num_q_free, :num_f],
+                    bufs.q_sb[d_chunk_idx][qkmax_grp // atp.num_q_grps_per_load][
+                        : ac.d_par,
+                        nl.ds((qkmax_grp % atp.num_q_grps_per_load) * _Q_GRP_SZ, num_q_free),
+                    ],
+                    bufs.k_sb[d_chunk_idx][k_tile_idx_in_section][:, :num_f],
+                )
 
             # Step 2: Masking
             num_p = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
