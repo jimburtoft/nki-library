@@ -973,7 +973,12 @@ def _compute_tile_parameters(
     atp.can_pack_q_load = not is_seqlen_sharded
 
     num_q_grps_per_load_dtype = 4 if ac.dtype == nl.float32 else 8  # fewer groups for float32 for SBUF memory
-    atp.num_q_grps_per_load = min(num_q_grps_per_load_dtype if atp.can_pack_q_load else 1, atp.num_grps)
+    # When d > _PAR_DIM_MAX and tp_q=True, we must use nc_transpose path (grps_per_load=1)
+    # because dma_transpose cannot do partial d-chunk loads (outer dims must be fully transposed)
+    if ac.tp_q and ac.d > _PAR_DIM_MAX:
+        atp.num_q_grps_per_load = 1
+    else:
+        atp.num_q_grps_per_load = min(num_q_grps_per_load_dtype if atp.can_pack_q_load else 1, atp.num_grps)
     kernel_assert(
         atp.num_q_grps_per_load > 0,
         f"num_q_grps_per_load must be positive, got {atp.num_q_grps_per_load}. "
@@ -1640,9 +1645,10 @@ def _load_q_tile(
 
             num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ)
             # q shape: (bs, seqlen, d), load chunk d[d_offset:d_offset+d_chunk_size]
+            # HBM stride between rows is d (full head_dim), SBUF stride is d_chunk_size (contiguous in buffer)
             loaded_dst_pat = loaded.ap(pattern=[[d_chunk_size, num_p], [1, d_chunk_size]], offset=0)
             q_src_pat = q.ap(
-                pattern=[[d_chunk_size, num_p], [1, d]],
+                pattern=[[d, num_p], [1, d_chunk_size]],
                 offset=batch_id * seqlen * d + seqlen_offset * d + d_offset,
             )
             nisa.dma_copy(dst=loaded_dst_pat, src=q_src_pat)
