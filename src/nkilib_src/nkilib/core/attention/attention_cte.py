@@ -126,6 +126,19 @@ logger = get_logger("attention_cte")
 
 _FLOAT32_MIN = -3.4028235e38  # used for initialization and masking
 
+
+def _psum_ndarray_with_address(shape, dtype, address):
+    """Allocate PSUM tensor with address= if supported, without if not.
+
+    Same rationale as _ndarray_with_address in modular_allocator: the address=
+    parameter may not be supported in all NKI compilation contexts.
+    """
+    try:
+        return nl.ndarray(shape, dtype=dtype, buffer=nl.psum, address=address)
+    except TypeError:
+        return nl.ndarray(shape, dtype=dtype, buffer=nl.psum)
+
+
 """
 Kernel constraints (based on tested range, values outside range might work in practice)
 """
@@ -1642,7 +1655,7 @@ def _load_q_tile(
             )
             loaded = local_allocator.alloc_sbuf_tensor(shape=(_Q_GRP_SZ, d_chunk_size), dtype=load_dtype)
             tp_dt = load_dtype
-            psum_buf = nl.ndarray((d_chunk_size, _Q_GRP_SZ), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
+            psum_buf = _psum_ndarray_with_address((d_chunk_size, _Q_GRP_SZ), tp_dt, (0, 0))
 
             num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ)
             # q shape: (bs, seqlen, d), load chunk d[d_offset:d_offset+d_chunk_size]
@@ -1813,7 +1826,7 @@ def _load_k_tile(
                 loaded = local_allocator.alloc_sbuf_tensor(shape=(sb_p, num_pe_tps, d), dtype=load_dtype)
                 sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
                 tp_dt = load_dtype
-                psum_buf = nl.ndarray((d, num_pe_tps, sb_p), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
+                psum_buf = _psum_ndarray_with_address((d, num_pe_tps, sb_p), tp_dt, (0, 0))
 
                 if load_offset is not None:
                     # NOTE: NKI is incapable of handling both dynamic and constant offsets in IndirectLoad, also it cannot handle

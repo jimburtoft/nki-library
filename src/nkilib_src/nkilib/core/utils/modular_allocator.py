@@ -32,6 +32,22 @@ from .allocator import sizeinbytes
 from .kernel_assert import kernel_assert
 
 
+def _ndarray_with_address(shape, dtype, buffer, address):
+    """Allocate nl.ndarray with address= if supported, without if not.
+
+    The `address=` parameter requires `enable_stack_allocator` to be active.
+    In some torchxla tracing contexts, the stack allocator hook may not
+    propagate correctly (e.g., through inlined sub-functions). In that case,
+    fall back to allocation without explicit address, which lets the compiler
+    handle memory placement automatically (less optimal but functional).
+    """
+    try:
+        return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer, address=address)
+    except TypeError:
+        # Stack allocator not active — fall back to compiler-managed allocation
+        return nl.ndarray(shape=shape, dtype=dtype, buffer=buffer)
+
+
 class ModularAllocator(nl.NKIObject):
     """
     A class-based modular allocator that manages SBUF memory allocation with modular
@@ -183,7 +199,7 @@ class ModularAllocator(nl.NKIObject):
 
         # Handle empty block_dim case - return a single tensor
         if len(block_dim) == 0:
-            tensor = nl.ndarray(
+            tensor = _ndarray_with_address(
                 shape=shape,
                 dtype=dtype,
                 buffer=nl.sbuf,
@@ -238,7 +254,7 @@ def _allocate_recursive(
             addr_offset += idx * stride
             stride *= num_free_tiles[dim_idx]
 
-        tensor = nl.ndarray(
+        tensor = _ndarray_with_address(
             shape=shape,
             dtype=dtype,
             buffer=nl.sbuf,
