@@ -134,6 +134,7 @@ _MAX_SEQLEN = 131072  # max allowed seqlen
 _MAX_BS_TIMES_SEQLEN_QK = 32.0 * 36864 * 36864  # max tested bs*seqlen_q*seqlen_k
 _MAX_HEAD_DIM = 256  # max supported head dim (d)
 _PAR_DIM_MAX = 128  # hardware partition dimension max (nl.tile_size.pmax)
+_PSUM_FMAX = 512  # hardware psum free dimension max (nl.tile_size.psum_fmax)
 _MIN_GLOBAL_CP_DEGREE = 1  # minimum context parallel degree
 _MAX_GLOBAL_CP_DEGREE = 32  # minimum context parallel degree
 
@@ -956,7 +957,7 @@ def _compute_tile_parameters(
                     atp.use_swa_optimized_allocation = True
 
     # Partition size
-    atp.sb_p = nl.tile_size.pmax
+    atp.sb_p = _PAR_DIM_MAX  # nl.tile_size.pmax is symbolic in torchxla mode; use constant
     # assert that _Q_GRP_SZ = _V_TILE_SZ = atp.sb_p (= 128) since that is an implict assumption in the code
     # and updating it requires careful updates.
     kernel_assert(
@@ -1214,7 +1215,7 @@ def _allocate_attention_buffers(
     """
 
     # Define the partition and free dimension for the two matmuls
-    mm1_p, mm1_n = atp.sb_p, nl.tile_size.psum_fmax
+    mm1_p, mm1_n = atp.sb_p, _PSUM_FMAX  # nl.tile_size.psum_fmax is symbolic in torchxla mode
     mm2_p, mm2_n = atp.sb_p, ac.d
 
     # For MM1, d is the reduction dim. When d > _PAR_DIM_MAX, we tile d into chunks.
@@ -1746,7 +1747,7 @@ def _load_k_tile(
             _, _, seqlen_prior = k_prior.shape
     if num_tiles > 0:
         d, n = out[0].shape  # d is d_par (possibly < d_full when tiling head_dim)
-    sb_p = nl.tile_size.pmax
+    sb_p = _PAR_DIM_MAX  # nl.tile_size.pmax is symbolic in torchxla mode
     stride_f = _K_TILE_SZ
     # d_full is the actual head_dim in HBM (may differ from d when d > _PAR_DIM_MAX)
     if d_full is None:
