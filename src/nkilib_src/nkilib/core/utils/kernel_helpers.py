@@ -306,7 +306,16 @@ def get_program_sharding_info() -> Tuple[int, int, int]:
         return (grid_ndim, n_prgs, prg_id)
     """
     grid_ndim = nl.program_ndim()
-    n_prgs, prg_id = (nl.num_programs(axes=0), nl.program_id(axis=0)) if grid_ndim != 0 else (1, 0)
+    if grid_ndim != 0:
+        n_prgs = nl.num_programs(axes=0)
+        prg_id = nl.program_id(axis=0)
+        # Workaround: In torchxla mode (e.g., NxDI), program_ndim() may return
+        # non-zero even without an explicit grid, while num_programs() returns None.
+        # Fall back to unsharded execution in this case.
+        if n_prgs is None:
+            grid_ndim, n_prgs, prg_id = 0, 1, 0
+    else:
+        n_prgs, prg_id = 1, 0
     return grid_ndim, n_prgs, prg_id
 
 
