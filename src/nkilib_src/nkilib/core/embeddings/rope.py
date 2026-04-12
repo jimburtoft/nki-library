@@ -177,22 +177,34 @@ def RoPE_sbuf(
     sin_sb: nl.ndarray,
     x_out_sb: nl.ndarray,
     convert_from_interleaved: bool = False,
+    rotary_dim: int = 0,
 ) -> nl.ndarray:
     """
     Apply RoPE on tensors in SBUF (for megakernel fusion).
     Helper function that operates entirely in SBUF without HBM I/O.
 
-    RoPE Formula:
+    Supports partial RoPE where only the first ``rotary_dim`` elements of the
+    head dimension are rotated and the remaining elements are copied unchanged.
+
+    RoPE Formula (full rotation, rotary_dim == 0 or rotary_dim == d_head):
         out[even] = x[even]*cos - x[odd]*sin
         out[odd] = x[odd]*cos + x[even]*sin
 
+    Partial RoPE Formula (0 < rotary_dim < d_head):
+        r = rotary_dim // 2
+        out[0:r]              = x[0:r]*cos - x[r:rotary_dim]*sin
+        out[r:rotary_dim]     = x[r:rotary_dim]*cos + x[0:r]*sin
+        out[rotary_dim:d_head] = x[rotary_dim:d_head]  (pass-through)
+
     Args:
         x_in_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - input embeddings
-        cos_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - cosine frequencies
-        sin_sb (nl.ndarray): [d_head//2, B, S] @ SBUF - sine frequencies
+        cos_sb (nl.ndarray): [rotary_dim//2, B, S] @ SBUF - cosine frequencies
+        sin_sb (nl.ndarray): [rotary_dim//2, B, S] @ SBUF - sine frequencies
         x_out_sb (nl.ndarray): [d_head, B, n_heads, S] @ SBUF - output buffer
         convert_from_interleaved (bool): convert from interleaved to contiguous layout
             (only for small tensors: B*n_heads*S ≤ gemm_moving_fmax)
+        rotary_dim (int): Number of head dimensions to rotate. 0 means full d_head (default).
+            Must be even and <= d_head.
 
     Returns:
         nl.ndarray: x_out_sb with RoPE applied (modified in-place)
@@ -200,58 +212,78 @@ def RoPE_sbuf(
     Notes:
         - Assumes contiguous layout unless convert_from_interleaved=True
         - For large tensors with interleaved layout, use RoPE() with strided DMA
+        - When rotary_dim < d_head, the non-rotary dimensions are copied from
+          x_in_sb to x_out_sb unchanged
     """
 
     d_head, B, n_heads, S = x_out_sb.shape
-    half_d = d_head // 2
 
-    _validate_rope_inputs(x_in_sb, cos_sb, sin_sb, 'RoPE_sbuf')
+    # Determine effective rotary dimension
+    if rotary_dim > 0:
+        rot_d = rotary_dim
+    else:
+        rot_d = d_head
+    rot_half = rot_d // 2
+    is_partial = rot_d < d_head
+
+    _validate_rope_inputs(x_in_sb, cos_sb, sin_sb, 'RoPE_sbuf', rotary_dim=rotary_dim)
     kernel_assert(x_in_sb.dtype == x_out_sb.dtype, 'RoPE_sbuf: dtype mismatch between x_in_sb and x_out_sb')
+    kernel_assert(rot_d % 2 == 0, f'RoPE_sbuf: rotary_dim must be even, got {rot_d}')
+    kernel_assert(rot_d <= d_head, f'RoPE_sbuf: rotary_dim ({rot_d}) must be <= d_head ({d_head})')
 
     # Convert interleaved to contiguous layout if needed
     if convert_from_interleaved:
         convert_to_interleaved_mat = _compute_convert_to_interleaved_mat(x_in_sb)
         x_in_sb = _convert_from_interleaved(x_in_sb, convert_to_interleaved_mat)
 
-    # Copy odd half to separate buffer (required for tensor_tensor base partition alignment)
-    sb_odd = nl.ndarray((half_d, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=sb_odd, src=x_in_sb[half_d:, :, :, :])
+    # Copy second half of rotary dims to separate buffer
+    # (required for tensor_tensor base partition alignment)
+    sb_odd = nl.ndarray((rot_half, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=sb_odd, src=x_in_sb[nl.ds(rot_half, rot_half), :, :, :])
 
     # Allocate buffers for intermediate products
-    even_cos = nl.ndarray((half_d, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
-    odd_cos = nl.ndarray((half_d, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
-    even_sin = nl.ndarray((half_d, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
-    odd_sin = nl.ndarray((half_d, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
+    even_cos = nl.ndarray((rot_half, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
+    odd_cos = nl.ndarray((rot_half, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
+    even_sin = nl.ndarray((rot_half, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
+    odd_sin = nl.ndarray((rot_half, B, n_heads, S), dtype=x_in_sb.dtype, buffer=nl.sbuf)
 
     # Compute RoPE: out_even = even*cos - odd*sin, out_odd = odd*cos + even*sin
     # Use access patterns to broadcast cos/sin across n_heads dimension
     nisa.tensor_tensor(
         even_cos,
-        x_in_sb[:half_d, :, :, :],
+        x_in_sb[:rot_half, :, :, :],
         TensorView(cos_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
         nl.multiply,
     )
     nisa.tensor_tensor(
         odd_cos,
-        sb_odd[:half_d, :, :, :],
+        sb_odd[:rot_half, :, :, :],
         TensorView(cos_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
         nl.multiply,
     )
     nisa.tensor_tensor(
         even_sin,
-        x_in_sb[:half_d, :, :, :],
+        x_in_sb[:rot_half, :, :, :],
         TensorView(sin_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
         nl.multiply,
     )
     nisa.tensor_tensor(
         odd_sin,
-        sb_odd[:half_d, :, :, :],
+        sb_odd[:rot_half, :, :, :],
         TensorView(sin_sb).expand_dim(2).broadcast(dim=2, size=n_heads).get_view(),
         nl.multiply,
     )
 
-    nisa.tensor_tensor(x_out_sb[:half_d, :, :, :], even_cos, odd_sin, nl.subtract)
-    nisa.tensor_tensor(x_out_sb[half_d:, :, :, :], odd_cos, even_sin, nl.add)
+    nisa.tensor_tensor(x_out_sb[:rot_half, :, :, :], even_cos, odd_sin, nl.subtract)
+    nisa.tensor_tensor(x_out_sb[nl.ds(rot_half, rot_half), :, :, :], odd_cos, even_sin, nl.add)
+
+    # Copy non-rotary dimensions unchanged
+    if is_partial:
+        passthrough_dim = d_head - rot_d
+        nisa.tensor_copy(
+            dst=x_out_sb[nl.ds(rot_d, passthrough_dim), :, :, :],
+            src=x_in_sb[nl.ds(rot_d, passthrough_dim), :, :, :],
+        )
 
     # Convert back to interleaved layout if needed
     if convert_from_interleaved:
@@ -381,15 +413,18 @@ def _convert_to_interleaved(x_sb: nl.ndarray, convert_to_interleaved_mat: nl.nda
     return x_sb
 
 
-def _validate_rope_inputs(x_in: nl.ndarray, cos: nl.ndarray, sin: nl.ndarray, func_name: str) -> None:
+def _validate_rope_inputs(
+    x_in: nl.ndarray, cos: nl.ndarray, sin: nl.ndarray, func_name: str, rotary_dim: int = 0
+) -> None:
     """
     Validate RoPE input tensor shapes and constraints.
 
     Args:
         x_in (nl.ndarray): [d_head, B, n_heads, S], Input embeddings
-        cos (nl.ndarray): [d_head//2, B, S], Cosine frequencies
-        sin (nl.ndarray): [d_head//2, B, S], Sine frequencies
+        cos (nl.ndarray): [rotary_dim//2, B, S], Cosine frequencies
+        sin (nl.ndarray): [rotary_dim//2, B, S], Sine frequencies
         func_name (str): Name of calling function for error messages
+        rotary_dim (int): Number of dimensions to rotate. 0 means full d_head (default).
 
     Returns:
         None
@@ -400,9 +435,13 @@ def _validate_rope_inputs(x_in: nl.ndarray, cos: nl.ndarray, sin: nl.ndarray, fu
         - Validates S in (0, 512]
         - Validates n_heads in (0, 16]
         - Validates cos/sin shapes match expected dimensions
+        - When rotary_dim > 0, cos/sin first dim is rotary_dim//2 instead of d_head//2
     """
     d_head, B, n_heads, S = x_in.shape
-    half_d = d_head // 2
+    if rotary_dim > 0:
+        expected_cos_dim = rotary_dim // 2
+    else:
+        expected_cos_dim = d_head // 2
 
     kernel_assert(d_head in (64, 128), f'{func_name}: d_head must be 64 or 128, got {d_head}')
     kernel_assert(B > 0, f'{func_name}: B must be > 0, got {B}')
@@ -410,11 +449,11 @@ def _validate_rope_inputs(x_in: nl.ndarray, cos: nl.ndarray, sin: nl.ndarray, fu
     kernel_assert(n_heads > 0, f'{func_name}: n_heads must be > 0, got {n_heads}')
 
     kernel_assert(
-        tuple(cos.shape) == (half_d, B, S),
-        f'{func_name}: cos.shape expected ({half_d},{B},{S}), got {cos.shape}',
+        tuple(cos.shape) == (expected_cos_dim, B, S),
+        f'{func_name}: cos.shape expected ({expected_cos_dim},{B},{S}), got {cos.shape}',
     )
     kernel_assert(
-        tuple(sin.shape) == (half_d, B, S),
-        f'{func_name}: sin.shape expected ({half_d},{B},{S}), got {sin.shape}',
+        tuple(sin.shape) == (expected_cos_dim, B, S),
+        f'{func_name}: sin.shape expected ({expected_cos_dim},{B},{S}), got {sin.shape}',
     )
     kernel_assert(cos.dtype == sin.dtype, f'{func_name}: cos/sin dtype mismatch')

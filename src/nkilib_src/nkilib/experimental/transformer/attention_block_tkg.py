@@ -99,6 +99,7 @@ def attention_block_tkg(
     cos: Optional[nl.ndarray],
     sin: Optional[nl.ndarray],
     rope_contiguous_layout: bool,
+    rotary_dim: int = 0,
     # -- Q/K processing: post-RoPE RMSNorm
     rmsnorm_QK_post_rope_enabled: bool,
     rmsnorm_QK_post_rope_eps: float,
@@ -181,9 +182,14 @@ def attention_block_tkg(
         rmsnorm_QK_pre_rope_eps (float): Pre-RoPE RMSNorm epsilon
         rmsnorm_QK_pre_rope_W_Q (Optional[nl.ndarray]): [1, d_head] @ HBM, Pre-RoPE Q gamma weights
         rmsnorm_QK_pre_rope_W_K (Optional[nl.ndarray]): [1, d_head] @ HBM, Pre-RoPE K gamma weights
-        cos (Optional[nl.ndarray]): [d_head//2, B, S_tkg] @ HBM, RoPE cosine embeddings (None = skip RoPE)
-        sin (Optional[nl.ndarray]): [d_head//2, B, S_tkg] @ HBM, RoPE sine embeddings (None = skip RoPE)
+        cos (Optional[nl.ndarray]): [rotary_dim//2, B, S_tkg] @ HBM, RoPE cosine embeddings (None = skip RoPE).
+            Shape uses rotary_dim//2 (or d_head//2 when rotary_dim is 0 or d_head).
+        sin (Optional[nl.ndarray]): [rotary_dim//2, B, S_tkg] @ HBM, RoPE sine embeddings (None = skip RoPE).
+            Shape uses rotary_dim//2 (or d_head//2 when rotary_dim is 0 or d_head).
         rope_contiguous_layout (bool): True for contiguous halves, False for interleaved
+        rotary_dim (int): Number of head dimensions that use rotary embeddings. 0 means full
+            d_head (default). When 0 < rotary_dim < d_head, only the first rotary_dim dimensions
+            are rotated and the rest are passed through unchanged (partial RoPE).
         rmsnorm_QK_post_rope_enabled (bool): Apply RMSNorm to Q/K after RoPE
         rmsnorm_QK_post_rope_eps (float): Post-RoPE RMSNorm epsilon
         rmsnorm_QK_post_rope_W_Q (Optional[nl.ndarray]): [1, d_head] @ HBM, Post-RoPE Q weights
@@ -327,6 +333,7 @@ def attention_block_tkg(
         v_scale,
         KVDP,
         KVDP_replica_group,
+        rotary_dim=rotary_dim,
     )
 
     B, S_tkg = config['B'], config['S_tkg']
@@ -386,6 +393,7 @@ def attention_block_tkg(
         rmsnorm_QK_post_rope_W_Q,
         rmsnorm_QK_post_rope_W_K,
         sbm,
+        rotary_dim=rotary_dim,
     )
 
     # Extract V from QKV to SBUF, then copy to HBM for attention_tkg
@@ -588,6 +596,7 @@ def _validate_and_extract_config(
     v_scale: Optional[nl.ndarray],
     KVDP: int,
     KVDP_replica_group: Optional[ReplicaGroup],
+    rotary_dim: int = 0,
 ) -> Dict[str, Any]:
     """
     Validate inputs and extract configuration parameters for attention block.
@@ -702,13 +711,14 @@ def _validate_and_extract_config(
 
     # Validate RoPE embeddings
     if cos is not None and sin is not None:
+        rope_half = rotary_dim // 2 if rotary_dim > 0 else half_d
         kernel_assert(
-            tuple(cos.shape) == (half_d, B, S_tkg),
-            f"cos shape mismatch: expected ({half_d}, {B}, {S_tkg}), got {cos.shape}",
+            tuple(cos.shape) == (rope_half, B, S_tkg),
+            f"cos shape mismatch: expected ({rope_half}, {B}, {S_tkg}), got {cos.shape}",
         )
         kernel_assert(
-            tuple(sin.shape) == (half_d, B, S_tkg),
-            f"sin shape mismatch: expected ({half_d}, {B}, {S_tkg}), got {sin.shape}",
+            tuple(sin.shape) == (rope_half, B, S_tkg),
+            f"sin shape mismatch: expected ({rope_half}, {B}, {S_tkg}), got {sin.shape}",
         )
 
     # KV Quantization
@@ -842,6 +852,7 @@ def _process_head_group(
     rmsnorm_post_eps: float,
     rmsnorm_post_W: Optional[nl.ndarray],
     sbm: SbufManager,
+    rotary_dim: int = 0,
 ) -> nl.ndarray:
     """
     Process Q or K: extract heads, transpose to [d, B*n_heads*S], apply optional RMSNorm pre/post and RoPE.
@@ -863,7 +874,9 @@ def _process_head_group(
     if enable_rope:
         out_4d = out.reshape((d, B, n_heads, S))
         out_rope = sbm.alloc_stack(out_4d.shape, dtype=out.dtype, buffer=nl.sbuf)
-        RoPE_sbuf(out_4d, sb_cos, sb_sin, out_rope, convert_from_interleaved=not rope_contiguous_layout)
+        RoPE_sbuf(
+            out_4d, sb_cos, sb_sin, out_rope, convert_from_interleaved=not rope_contiguous_layout, rotary_dim=rotary_dim
+        )
         out = out_rope.reshape((d, B * n_heads * S))
 
     # Post-RoPE RMSNorm
@@ -889,6 +902,7 @@ def _QK_processing(
     rmsnorm_post_W_Q: Optional[nl.ndarray],
     rmsnorm_post_W_K: Optional[nl.ndarray],
     sbm: SbufManager,
+    rotary_dim: int = 0,
 ) -> Tuple[nl.ndarray, nl.ndarray]:
     """
     Unified Q/K processing: transpose, optional pre-RoPE RMSNorm, optional RoPE, optional post-RoPE RMSNorm.
@@ -948,6 +962,7 @@ def _QK_processing(
         rmsnorm_post_eps=rmsnorm_post_eps,
         rmsnorm_post_W=rmsnorm_post_W_Q,
         sbm=sbm,
+        rotary_dim=rotary_dim,
     )
     K = _process_head_group(
         QKV,
@@ -967,6 +982,7 @@ def _QK_processing(
         rmsnorm_post_eps=rmsnorm_post_eps,
         rmsnorm_post_W=rmsnorm_post_W_K,
         sbm=sbm,
+        rotary_dim=rotary_dim,
     )
 
     return Q, K
