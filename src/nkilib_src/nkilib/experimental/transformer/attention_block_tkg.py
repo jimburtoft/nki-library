@@ -19,12 +19,12 @@ This kernel implements the attention block for token generation (TKG), fusing al
 
 It performs:
         +-------------------+   +-------------------+   +-------------------+   +-------------------+
-        | Input X (HBM)     |-->|   RMSNorm X       |-->| QKV Projection    |-->|  Split QKV → Q,K  |-->
-        | [B, S_tkg, H]     |   | (optional)        |   |                   |   |   (transpose)     |
+        | Input X (HBM)     |-->|   RMSNorm X       |-->| QKV Projection    |-->| Flat QK RMSNorm   |-->
+        | [B, S_tkg, H]     |   | (optional)        |   |                   |   | (optional)        |
         +-------------------+   +-------------------+   +-------------------+   +-------------------+
 
         +-------------------+   +-------------------+   +-------------------+   +-------------------+
-    --> | RMSNorm Q/K       |-->|   RoPE Embedding  |-->| RMSNorm Q/K       |-->| Quantize K/V      |-->
+    --> | Split QKV → Q,K   |-->| RMSNorm Q/K       |-->|   RoPE Embedding  |-->| RMSNorm Q/K       |-->| Quantize K/V      |-->
         | (optional)        |   | (optional)        |   | (optional)        |   | to FP8 (optional) |
         +-------------------+   +-------------------+   +-------------------+   +-------------------+
 
@@ -90,7 +90,12 @@ def attention_block_tkg(
     quantization_type_qkv: QuantizationType,
     weight_dequant_scale_qkv: Optional[nl.ndarray],
     input_dequant_scale_qkv: Optional[nl.ndarray],
-    # -- Q/K processing: pre-RoPE RMSNorm
+    # -- Q/K processing: flat QK RMSNorm (before head split, e.g. MiniMax-M2)
+    rmsnorm_QK_flat_enabled: bool = False,
+    rmsnorm_QK_flat_eps: float = 0.0,
+    rmsnorm_QK_flat_W_Q: Optional[nl.ndarray] = None,
+    rmsnorm_QK_flat_W_K: Optional[nl.ndarray] = None,
+    # -- Q/K processing: pre-RoPE RMSNorm (per-head, after head split)
     rmsnorm_QK_pre_rope_enabled: bool,
     rmsnorm_QK_pre_rope_eps: float,
     rmsnorm_QK_pre_rope_W_Q: Optional[nl.ndarray],
@@ -178,7 +183,15 @@ def attention_block_tkg(
         input_dequant_scale_qkv (Optional[nl.ndarray]): Input dequantization scale for QKV projection.
             Shape: [PMAX, 1] @ HBM when quantization_type_qkv is STATIC.
 
-        rmsnorm_QK_pre_rope_enabled (bool): Apply RMSNorm to Q/K before RoPE
+        rmsnorm_QK_flat_enabled (bool): Apply flat RMSNorm to Q/K before head split.
+            Normalizes across all Q (or K) heads concatenated along the free dimension
+            of the QKV tensor, before the head-split transpose. Used by models like
+            MiniMax-M2 that apply qk_norm on the full projection output.
+        rmsnorm_QK_flat_eps (float): Flat QK RMSNorm epsilon
+        rmsnorm_QK_flat_W_Q (Optional[nl.ndarray]): [1, q_heads*d_head] @ HBM, flat Q gamma weights
+        rmsnorm_QK_flat_W_K (Optional[nl.ndarray]): [1, kv_heads*d_head] @ HBM, flat K gamma weights
+
+        rmsnorm_QK_pre_rope_enabled (bool): Apply per-head RMSNorm to Q/K before RoPE
         rmsnorm_QK_pre_rope_eps (float): Pre-RoPE RMSNorm epsilon
         rmsnorm_QK_pre_rope_W_Q (Optional[nl.ndarray]): [1, d_head] @ HBM, Pre-RoPE Q gamma weights
         rmsnorm_QK_pre_rope_W_K (Optional[nl.ndarray]): [1, d_head] @ HBM, Pre-RoPE K gamma weights
@@ -284,6 +297,12 @@ def attention_block_tkg(
             X_norm = rms_norm(X, rmsnorm_X_gamma, rmsnorm_X_eps)
         QKV = matmul(X_norm, W_qkv) + bias_qkv
 
+        # Stage 1b: Flat QK RMSNorm (before head split)
+        if rmsnorm_QK_flat_enabled:
+            Q_flat, K_flat = split_QK(QKV)
+            Q_flat = rms_norm(Q_flat, rmsnorm_QK_flat_W_Q, rmsnorm_QK_flat_eps)
+            K_flat = rms_norm(K_flat, rmsnorm_QK_flat_W_K, rmsnorm_QK_flat_eps)
+
         # Stage 2: Q/K Processing
         Q, K = split_and_transpose(QKV)
         if rmsnorm_QK_pre_rope_enabled:
@@ -373,6 +392,20 @@ def attention_block_tkg(
         hidden_actual=X_hidden_dim_actual,
         sbm=sbm,
     )
+
+    # ========== Flat QK RMSNorm (before head split) ==========
+    # Applies RMSNorm across all Q (or K) heads concatenated in the free dimension
+    # of QKV_tkg_sb [B*S_tkg, I] @ SBUF, before the head-split transpose.
+    # Required by models like MiniMax-M2 that apply qk_norm on the full projection
+    # output rather than per-head after reshape.
+    if rmsnorm_QK_flat_enabled:
+        q_width = d_head * q_heads  # all Q heads concatenated
+        k_width = d_head * kv_heads  # K heads (typically 1)
+        k_offset = d_head * q_heads  # K starts after Q in the free dim
+        _rms_norm_flat(QKV_tkg_sb, offset=0, width=q_width, eps=rmsnorm_QK_flat_eps, w=rmsnorm_QK_flat_W_Q, sbm=sbm)
+        _rms_norm_flat(
+            QKV_tkg_sb, offset=k_offset, width=k_width, eps=rmsnorm_QK_flat_eps, w=rmsnorm_QK_flat_W_K, sbm=sbm
+        )
 
     # ========== Q/K Processing: Transpose + RMSNorm pre + RoPE + RMSNorm post ==========
     # Input:  QKV_tkg_sb [B*S_tkg, I] @ SBUF
@@ -1034,6 +1067,119 @@ def _rms_norm_inplace(
 
     # Copy result back to x with original dtype
     nisa.tensor_copy(dst=x, src=out_sb)
+
+
+def _rms_norm_flat(
+    qkv: nl.ndarray,
+    offset: int,
+    width: int,
+    eps: float,
+    w: Optional[nl.ndarray],
+    sbm: SbufManager,
+) -> None:
+    """
+    RMS normalization along the free dimension (in-place on a slice of QKV).
+
+    Normalizes a contiguous slice ``qkv[:, offset:offset+width]`` of an SBUF
+    tensor over its free dimension (``width`` elements), i.e.::
+
+        x_slice = x_slice / sqrt(mean(x_slice^2) + eps)  [* w]
+
+    This is the "flat" QK norm used by MiniMax-M2: it normalizes across all
+    Q (or K) heads concatenated, *before* the head-split transpose, so the
+    reduction width is ``q_heads * d_head`` for Q, or ``d_head`` for K.
+
+    The tensor layout at the call site is::
+
+        qkv  [B*S_tkg, I]  @  SBUF
+              ^P-dim    ^F-dim (I = d_head*(q_heads + 2*kv_heads))
+
+    Steps (all in fp32):
+      1. ``nisa.activation_reduce`` — fused square + free-dim reduce → ``[P, 1]``
+      2. ``nisa.activation(rsqrt, scale=1/width)``  → ``rsqrt(mean + eps)``
+      3. For each free-dim tile: multiply by rsqrt, optionally scale by ``w``,
+         write back.
+
+    Args:
+        qkv:    [P, I] @ SBUF — the full QKV tensor (modified in-place)
+        offset: start column of the Q or K slice within the free dimension
+        width:  number of columns to normalize (q_heads*d for Q, d for K)
+        eps:    RMSNorm epsilon
+        w:      [1, width] @ HBM — optional per-element scale (gamma)
+        sbm:    SBUF memory manager
+    """
+    P, I = qkv.shape
+
+    # --- 1. Reduce: sum(x^2) along the free dim for the [P, width] slice ---
+    # activation_reduce fuses square + add-reduce over the free dimension.
+    # It writes the per-element squared values into ``sq_dst`` and the
+    # reduced [P, 1] sum-of-squares into ``sum_sq``.
+    sq_dst = sbm.alloc_stack((P, width), dtype=nl.float32, buffer=nl.sbuf)
+    sum_sq = sbm.alloc_stack((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    zero_bias = sbm.alloc_stack((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(zero_bias, 0.0)
+
+    nisa.activation_reduce(
+        dst=sq_dst,
+        op=nl.square,
+        data=qkv[:, nl.ds(offset, width)],
+        reduce_op=nl.add,
+        reduce_res=sum_sq,
+        bias=zero_bias,
+        scale=1.0,
+    )
+
+    # --- 2. rsqrt(sum_sq / width + eps) ---
+    eps_sb = sbm.alloc_stack((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(eps_sb, eps)
+    nisa.activation(
+        dst=sum_sq,
+        op=nl.rsqrt,
+        data=sum_sq,
+        bias=eps_sb,
+        scale=1.0 / width,
+    )
+    # sum_sq now holds the rsqrt normalization factor  [P, 1]
+
+    # --- 3. Normalize: x_slice * rsqrt, with optional gamma ---
+    # Load optional gamma weights from HBM → SBUF
+    w_sb = None
+    if w is not None:
+        w_sb = sbm.alloc_stack((1, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(w_sb, w[:, :width])
+
+    # Process the slice in free-dim tiles (tile width limited by SBUF pressure)
+    # Each tile: multiply by rsqrt scalar (broadcast from [P, 1]), optionally
+    # scale by gamma, and write back.
+    tile_w = min(width, nl.tile_size.pmax)  # 128 max free-dim tile width
+    n_tiles = (width + tile_w - 1) // tile_w
+
+    for t in range(n_tiles):
+        col_start = offset + t * tile_w
+        tw = min(tile_w, width - t * tile_w)
+
+        # Read tile from qkv (cast to fp32)
+        tile_f32 = sbm.alloc_stack((P, tw), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(tile_f32, qkv[:, nl.ds(col_start, tw)])
+
+        # Multiply by rsqrt factor (broadcast [P, 1] -> [P, tw])
+        nisa.tensor_scalar(dst=tile_f32, data=tile_f32, op0=nl.multiply, operand0=sum_sq)
+
+        # Multiply by gamma weights (element-wise broadcast along P)
+        if w_sb is not None:
+            gamma_tile = sbm.alloc_stack((1, tw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(gamma_tile, w_sb[:, nl.ds(t * tile_w, tw)])
+            # Broadcast gamma [1, tw] across P dimension via psum matmul
+            ones_p = sbm.alloc_stack((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(ones_p, 1.0)
+            gamma_broadcast = nl.ndarray((P, tw), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(gamma_broadcast, stationary=ones_p, moving=gamma_tile)
+            gamma_sb = sbm.alloc_stack((P, tw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(gamma_sb, gamma_broadcast)
+            nisa.tensor_tensor(tile_f32, tile_f32, gamma_sb, nl.multiply)
+
+        # Write back in original dtype
+        nisa.tensor_copy(qkv[:, nl.ds(col_start, tw)], tile_f32)
 
 
 ############################# KV cache update logic #############################
