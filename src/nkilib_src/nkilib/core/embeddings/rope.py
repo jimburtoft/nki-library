@@ -18,7 +18,7 @@
 import nki
 import nki.isa as nisa
 import nki.language as nl
-import nki.tensor as ntensor
+import nki.typing as ntensor
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import get_verified_program_sharding_info

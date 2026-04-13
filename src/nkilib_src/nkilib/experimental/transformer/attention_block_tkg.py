@@ -72,13 +72,12 @@ from .attention_block_tkg_sharding import (
 
 
 # TODO(NKI-699): Refactor API to use configuration dataclasses for better clarity
-# Note: Using keyword-only args (via *) to avoid breaking callers when adding/reordering
-# parameters, and to improve readability given the large number of arguments.
+# Note: NKI 0.3.0 does NOT support keyword-only args (*,) in kernel signatures.
+# All parameters must be positional. Parameters with defaults are grouped at the end.
 @nki.jit
 def attention_block_tkg(
     # -- input
     X: nl.ndarray,
-    *,
     X_hidden_dim_actual: Optional[int],
     # -- rmsnorm X
     rmsnorm_X_enabled: bool,
@@ -90,11 +89,6 @@ def attention_block_tkg(
     quantization_type_qkv: QuantizationType,
     weight_dequant_scale_qkv: Optional[nl.ndarray],
     input_dequant_scale_qkv: Optional[nl.ndarray],
-    # -- Q/K processing: flat QK RMSNorm (before head split, e.g. MiniMax-M2)
-    rmsnorm_QK_flat_enabled: bool = False,
-    rmsnorm_QK_flat_eps: float = 0.0,
-    rmsnorm_QK_flat_W_Q: Optional[nl.ndarray] = None,
-    rmsnorm_QK_flat_W_K: Optional[nl.ndarray] = None,
     # -- Q/K processing: pre-RoPE RMSNorm (per-head, after head split)
     rmsnorm_QK_pre_rope_enabled: bool,
     rmsnorm_QK_pre_rope_eps: float,
@@ -104,7 +98,6 @@ def attention_block_tkg(
     cos: Optional[nl.ndarray],
     sin: Optional[nl.ndarray],
     rope_contiguous_layout: bool,
-    rotary_dim: int = 0,
     # -- Q/K processing: post-RoPE RMSNorm
     rmsnorm_QK_post_rope_enabled: bool,
     rmsnorm_QK_post_rope_eps: float,
@@ -117,12 +110,9 @@ def attention_block_tkg(
     V_cache: nl.ndarray,
     attention_mask: nl.ndarray,
     sink: Optional[nl.ndarray],
-    softmax_scale: Optional[float] = None,
     # -- KV cache update
     update_cache: bool,
     kv_cache_update_idx: Optional[nl.ndarray],
-    k_scale: Optional[nl.ndarray] = None,
-    v_scale: Optional[nl.ndarray] = None,
     # -- output projection
     W_out: Optional[nl.ndarray],
     bias_out: Optional[nl.ndarray],
@@ -132,11 +122,22 @@ def attention_block_tkg(
     transposed_out: bool,
     # -- output
     out_in_sb: bool,
+    # -- optional params with defaults (must come last for positional compat)
+    softmax_scale: Optional[float] = None,
+    enable_fa_s_prior_tiling: bool = True,
+    k_scale: Optional[nl.ndarray] = None,
+    v_scale: Optional[nl.ndarray] = None,
     sbm: Optional[SbufManager] = None,
     skip_attention: bool = False,
-    # -- KV data parallelism
     KVDP: int = 1,
     KVDP_replica_group: Optional[ReplicaGroup] = None,
+    # -- partial RoPE: only rotate the first rotary_dim dimensions (0 = full)
+    rotary_dim: int = 0,
+    # -- flat QK RMSNorm (before head split, e.g. MiniMax-M2)
+    rmsnorm_QK_flat_enabled: bool = False,
+    rmsnorm_QK_flat_eps: float = 0.0,
+    rmsnorm_QK_flat_W_Q: Optional[nl.ndarray] = None,
+    rmsnorm_QK_flat_W_K: Optional[nl.ndarray] = None,
 ):
     """
     Fused Attention Block for Token Generation (TKG).
