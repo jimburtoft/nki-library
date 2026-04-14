@@ -1399,13 +1399,14 @@ def _update_flat_cache(
     Update flat (non-block) KV cache with new tokens using per-batch scalar_offset.
 
     This version iterates over batches and uses scalar_offset for indirect addressing.
-    Supports any B*S_tkg <= PMAX and handles both transposed and non-transposed K cache layouts.
+    Flattens cache to 2D and computes absolute token indices (matching the approach used
+    in _update_flat_cache_batched) to avoid indirect_dim mismatches on 3D tensors.
 
     Args:
         K_cache: [B, d_head, S_max_ctx] if transposed else [B, S_max_ctx, d_head] @ HBM
         V_cache: [B, S_max_ctx, d_head] @ HBM
         K_tkg: [d_head, B*S_tkg] @ SBUF
-        V_tkg: [B*S_tkg, d_head] @ SBUF
+        V_tkg: [B*S_tkg, d_head] @ SBUF or [B, 1, S_tkg, d_head] @ HBM
         K_cache_transposed: K cache layout flag
         kv_cache_update_idx: [B, 1] per-batch write positions
         S_tkg: number of new tokens per batch
@@ -1415,6 +1416,8 @@ def _update_flat_cache(
     """
     _, n_prgs, prg_id = get_verified_program_sharding_info("kv_cache update", (0, 1), 2)
     kernel_assert(n_prgs <= 2, f"Expected lnc in [1,2], got {n_prgs}")
+
+    v_on_hbm = V_tkg.buffer != nl.sbuf
 
     # Validate tensor shapes
     kernel_assert(
@@ -1426,46 +1429,71 @@ def _update_flat_cache(
         f"V_cache shape mismatch: expected {(B, S_max_ctx, d_head)}, got {V_cache.shape}",
     )
     kernel_assert(
-        V_tkg.shape == (B * S_tkg, d_head),
-        f"V_tkg shape mismatch: expected {(B * S_tkg, d_head)}, got {V_tkg.shape}",
-    )
-    kernel_assert(
         K_tkg.shape == (d_head, B * S_tkg),
         f"K_tkg shape mismatch: expected {(d_head, B * S_tkg)}, got {K_tkg.shape}",
     )
 
-    # Update V_cache on lnc=0
+    # Transpose K for non-transposed K cache layout (needed on lnc=1)
+    if not K_cache_transposed and (n_prgs == 1 or prg_id == 1):
+        kernel_assert(
+            B * S_tkg <= nl.tile_size.pmax and d_head <= nl.tile_size.pmax,
+            f"Transpose constraints: B*S_tkg={B * S_tkg}, d_head={d_head} (both must be <= {nl.tile_size.pmax})",
+        )
+        K_reshaped_sb = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.sbuf)
+        _transpose_sbuf(K_tkg, K_reshaped_sb)
+
+    # ---- V_cache update (lnc=0) ----
+    # Flatten V_cache to 2D: (B*S_max_ctx, d_head), compute absolute row index per batch.
+    # This avoids using indirect_dim on a 3D tensor with a 2D AP pattern, which can
+    # cause incorrect DMA addressing.
     if n_prgs == 1 or prg_id == 0:
-        start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+        abs_idx = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
         for batch_idx in range(B):
-            nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+            # abs_idx = kv_cache_update_idx[batch_idx] + batch_idx * S_max_ctx
+            nisa.dma_copy(abs_idx, kv_cache_update_idx[batch_idx])
+            if batch_idx > 0:
+                batch_off = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+                nisa.iota(batch_off, [[0, 1]], offset=batch_idx * S_max_ctx)
+                nisa.tensor_tensor(abs_idx, abs_idx, batch_off, nl.add)
+            # Load V source
+            if v_on_hbm:
+                v_src = V_tkg.reshape((B * S_tkg, d_head))[nl.ds(batch_idx * S_tkg, S_tkg), :]
+            else:
+                v_src = V_tkg[nl.ds(batch_idx * S_tkg, S_tkg), :]
             nisa.dma_copy(
-                dst=V_cache.ap(
+                dst=V_cache.reshape((B * S_max_ctx, d_head)).ap(
                     pattern=[[d_head, S_tkg], [1, d_head]],
-                    offset=batch_idx * S_max_ctx * d_head,
-                    scalar_offset=start_position,
-                    indirect_dim=1,
+                    offset=0,
+                    scalar_offset=abs_idx,
+                    indirect_dim=0,
                 ),
-                src=V_tkg[nl.ds(batch_idx * S_tkg, S_tkg), :],
+                src=v_src,
             )
 
-    # Update K_cache on lnc=1
+    # ---- K_cache update (lnc=1) ----
     if n_prgs == 1 or prg_id == 1:
         if K_cache_transposed:
             kernel_assert(
                 K_cache.shape == (B, d_head, S_max_ctx),
                 f"K_cache shape mismatch: expected {(B, d_head, S_max_ctx)}, got {K_cache.shape}",
             )
-            # K_tkg is already in correct layout [d_head, B*S_tkg]
-            start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            # K_cache [B, d_head, S_max_ctx] flattened to (B*d_head*S_max_ctx,)
+            # Scatter K_tkg columns: for each batch, write S_tkg values into d_head
+            # positions at stride S_max_ctx, starting at abs_idx.
+            abs_idx = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
             for batch_idx in range(B):
-                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+                # abs_idx = kv_cache_update_idx[batch_idx] + batch_idx * d_head * S_max_ctx
+                nisa.dma_copy(abs_idx, kv_cache_update_idx[batch_idx])
+                if batch_idx > 0:
+                    batch_off = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+                    nisa.iota(batch_off, [[0, 1]], offset=batch_idx * d_head * S_max_ctx)
+                    nisa.tensor_tensor(abs_idx, abs_idx, batch_off, nl.add)
                 nisa.dma_copy(
-                    dst=K_cache.ap(
+                    dst=K_cache.reshape((B * d_head * S_max_ctx,)).ap(
                         pattern=[[S_max_ctx, d_head], [1, S_tkg]],
-                        offset=batch_idx * d_head * S_max_ctx,
-                        scalar_offset=start_position,
-                        indirect_dim=2,
+                        offset=0,
+                        scalar_offset=abs_idx,
+                        indirect_dim=0,
                     ),
                     src=K_tkg[:, nl.ds(batch_idx * S_tkg, S_tkg)],
                 )
@@ -1474,25 +1502,20 @@ def _update_flat_cache(
                 K_cache.shape == (B, S_max_ctx, d_head),
                 f"K_cache shape mismatch: expected {(B, S_max_ctx, d_head)}, got {K_cache.shape}",
             )
-            kernel_assert(
-                B * S_tkg <= nl.tile_size.pmax and d_head <= nl.tile_size.pmax,
-                f"Transpose constraints: B*S_tkg={B * S_tkg}, d_head={d_head} (both must be <= {nl.tile_size.pmax})",
-            )
-
-            # Transpose K_tkg from [d_head, B*S_tkg] to [B*S_tkg, d_head]
-            K_reshaped_sb = nl.ndarray((B * S_tkg, d_head), K_tkg.dtype, nl.sbuf)
-            _transpose_sbuf(K_tkg, K_reshaped_sb)
-
-            # Write transposed K to cache
-            start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            # K_cache [B, S_max_ctx, d_head] same layout as V, flatten to (B*S_max_ctx, d_head)
+            abs_idx = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
             for batch_idx in range(B):
-                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+                nisa.dma_copy(abs_idx, kv_cache_update_idx[batch_idx])
+                if batch_idx > 0:
+                    batch_off = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+                    nisa.iota(batch_off, [[0, 1]], offset=batch_idx * S_max_ctx)
+                    nisa.tensor_tensor(abs_idx, abs_idx, batch_off, nl.add)
                 nisa.dma_copy(
-                    dst=K_cache.ap(
+                    dst=K_cache.reshape((B * S_max_ctx, d_head)).ap(
                         pattern=[[d_head, S_tkg], [1, d_head]],
-                        offset=batch_idx * S_max_ctx * d_head,
-                        scalar_offset=start_position,
-                        indirect_dim=1,
+                        offset=0,
+                        scalar_offset=abs_idx,
+                        indirect_dim=0,
                     ),
                     src=K_reshaped_sb[nl.ds(batch_idx * S_tkg, S_tkg), :],
                 )
