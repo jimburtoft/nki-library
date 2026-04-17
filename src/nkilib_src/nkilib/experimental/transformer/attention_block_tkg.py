@@ -1509,8 +1509,9 @@ def _update_flat_cache(
     Update flat (non-block) KV cache with new tokens using per-batch scalar_offset.
 
     This version iterates over batches and uses scalar_offset for indirect addressing.
-    Supports any B*S_tkg via tiled K transpose. When V_tkg is on HBM, V is loaded
-    per-batch.
+    Flattens cache to 2D (or 1D for transposed K) and computes absolute token indices
+    (matching the approach used in _update_flat_cache_batched) to avoid indirect_dim
+    mismatches on 3D tensors with 2D AP patterns.
 
     Args:
         K_cache: [B, d_head, S_max_ctx] if transposed else [B, S_max_ctx, d_head] @ HBM
@@ -1543,46 +1544,59 @@ def _update_flat_cache(
         f"K_tkg shape mismatch: expected {(d_head, B * S_tkg)}, got {K_tkg.shape}",
     )
 
-    # Tiled K transpose for non-transposed K cache
+    # Tiled K transpose for non-transposed K cache layout (needed on lnc=1)
     if not K_cache_transposed and (n_prgs == 1 or prg_id == 1):
         K_transposed_sb, tile_sz = _tiled_k_transpose(K_tkg, B, S_tkg)
 
-    # Update V_cache on lnc=0
+    # ---- V_cache update (lnc=0) ----
+    # Flatten V_cache to 2D: (B*S_max_ctx, d_head), compute absolute row index per batch.
+    # This avoids using indirect_dim on a 3D tensor with a 2D AP pattern, which can
+    # cause incorrect DMA addressing at B=1.
     if n_prgs == 1 or prg_id == 0:
-        start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+        abs_idx = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
         for batch_idx in range(B):
-            nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+            # abs_idx = kv_cache_update_idx[batch_idx] + batch_idx * S_max_ctx
+            nisa.dma_copy(abs_idx, kv_cache_update_idx[batch_idx])
+            if batch_idx > 0:
+                batch_off = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+                nisa.iota(batch_off, [[0, 1]], offset=batch_idx * S_max_ctx)
+                nisa.tensor_tensor(abs_idx, abs_idx, batch_off, nl.add)
             if v_on_hbm:
                 v_src = V_tkg.reshape((B * S_tkg, d_head))[nl.ds(batch_idx * S_tkg, S_tkg), :]
             else:
                 v_src = V_tkg[nl.ds(batch_idx * S_tkg, S_tkg), :]
             nisa.dma_copy(
-                dst=V_cache.ap(
+                dst=V_cache.reshape((B * S_max_ctx, d_head)).ap(
                     pattern=[[d_head, S_tkg], [1, d_head]],
-                    offset=batch_idx * S_max_ctx * d_head,
-                    scalar_offset=start_position,
-                    indirect_dim=1,
+                    offset=0,
+                    scalar_offset=abs_idx,
+                    indirect_dim=0,
                 ),
                 src=v_src,
             )
 
-    # Update K_cache on lnc=1
+    # ---- K_cache update (lnc=1) ----
     if n_prgs == 1 or prg_id == 1:
         if K_cache_transposed:
             kernel_assert(
                 K_cache.shape == (B, d_head, S_max_ctx),
                 f"K_cache shape mismatch: expected {(B, d_head, S_max_ctx)}, got {K_cache.shape}",
             )
-            # K_tkg is already in correct layout [d_head, B*S_tkg]
-            start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            # K_cache [B, d_head, S_max_ctx] flattened to (B*d_head*S_max_ctx,)
+            abs_idx = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
             for batch_idx in range(B):
-                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+                # abs_idx = kv_cache_update_idx[batch_idx] + batch_idx * d_head * S_max_ctx
+                nisa.dma_copy(abs_idx, kv_cache_update_idx[batch_idx])
+                if batch_idx > 0:
+                    batch_off = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+                    nisa.iota(batch_off, [[0, 1]], offset=batch_idx * d_head * S_max_ctx)
+                    nisa.tensor_tensor(abs_idx, abs_idx, batch_off, nl.add)
                 nisa.dma_copy(
-                    dst=K_cache.ap(
+                    dst=K_cache.reshape((B * d_head * S_max_ctx,)).ap(
                         pattern=[[S_max_ctx, d_head], [1, S_tkg]],
-                        offset=batch_idx * d_head * S_max_ctx,
-                        scalar_offset=start_position,
-                        indirect_dim=2,
+                        offset=0,
+                        scalar_offset=abs_idx,
+                        indirect_dim=0,
                     ),
                     src=K_tkg[:, nl.ds(batch_idx * S_tkg, S_tkg)],
                 )
@@ -1591,17 +1605,21 @@ def _update_flat_cache(
                 K_cache.shape == (B, S_max_ctx, d_head),
                 f"K_cache shape mismatch: expected {(B, S_max_ctx, d_head)}, got {K_cache.shape}",
             )
-            # Write transposed K to cache — index into tiled K_transposed_sb
-            start_position = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+            # K_cache [B, S_max_ctx, d_head] same layout as V, flatten to (B*S_max_ctx, d_head)
+            abs_idx = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
             for batch_idx in range(B):
-                nisa.dma_copy(start_position, kv_cache_update_idx[batch_idx])
+                nisa.dma_copy(abs_idx, kv_cache_update_idx[batch_idx])
+                if batch_idx > 0:
+                    batch_off = nl.ndarray((1, 1), dtype=nl.uint32, buffer=nl.sbuf)
+                    nisa.iota(batch_off, [[0, 1]], offset=batch_idx * S_max_ctx)
+                    nisa.tensor_tensor(abs_idx, abs_idx, batch_off, nl.add)
                 k_src = _get_k_transposed_slice(K_transposed_sb, tile_sz, batch_idx, S_tkg)
                 nisa.dma_copy(
-                    dst=K_cache.ap(
+                    dst=K_cache.reshape((B * S_max_ctx, d_head)).ap(
                         pattern=[[d_head, S_tkg], [1, d_head]],
-                        offset=batch_idx * S_max_ctx * d_head,
-                        scalar_offset=start_position,
-                        indirect_dim=1,
+                        offset=0,
+                        scalar_offset=abs_idx,
+                        indirect_dim=0,
                     ),
                     src=k_src,
                 )
