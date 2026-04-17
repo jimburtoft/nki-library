@@ -132,7 +132,18 @@ from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 
 logger = get_logger("attention_cte")
 
-_FLOAT32_MIN = -3.4028235e38  # used for initialization and masking
+
+def _psum_ndarray_with_address(shape, dtype, address):
+    """Allocate PSUM tensor with address= if supported, without if not.
+
+    Same rationale as _ndarray_with_address in modular_allocator: the address=
+    parameter may not be supported in all NKI compilation contexts.
+    """
+    try:
+        return nl.ndarray(shape, dtype=dtype, buffer=nl.psum, address=address)
+    except TypeError:
+        return nl.ndarray(shape, dtype=dtype, buffer=nl.psum)
+
 
 """
 Kernel constraints (based on tested range, values outside range might work in practice)
@@ -989,7 +1000,7 @@ def _compute_tile_parameters(
                     atp.use_swa_optimized_allocation = True
 
     # Partition size
-    atp.sb_p = nl.tile_size.pmax
+    atp.sb_p = 128  # nl.tile_size.pmax returns symbolic -1 in torchxla mode
     # assert that _Q_GRP_SZ = _V_TILE_SZ = atp.sb_p (= 128) since that is an implict assumption in the code
     # and updating it requires careful updates.
     kernel_assert(
@@ -1271,7 +1282,7 @@ def _allocate_attention_buffers(
     """
 
     # Define the partition and free dimension for the two matmuls
-    mm1_p, mm1_n = atp.sb_p, nl.tile_size.psum_fmax
+    mm1_p, mm1_n = atp.sb_p, 512  # nl.tile_size.psum_fmax returns symbolic -1 in torchxla mode
     mm2_p, mm2_n = atp.sb_p, ac.d
 
     p_k, n_k = ac.d, _K_TILE_SZ  # d is reduction dim for MM1
@@ -1683,7 +1694,7 @@ def _load_q_tile(q, out, tp_q, batch_id, grp_i, seqlen_offset, load_dtype, sbuf_
             )
             loaded = local_allocator.alloc_sbuf_tensor(shape=(_Q_GRP_SZ, d), dtype=load_dtype)
             tp_dt = load_dtype
-            psum_buf = nl.ndarray((d, _Q_GRP_SZ), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
+            psum_buf = _psum_ndarray_with_address((d, _Q_GRP_SZ), tp_dt, (0, 0))
 
             num_p = min(seqlen - seqlen_offset, _Q_GRP_SZ)
             # Convert load() to access pattern
@@ -1784,7 +1795,7 @@ def _load_k_tile(
             _, _, seqlen_prior = k_prior.shape
     if num_tiles > 0:
         d, n = out[0].shape
-    sb_p = nl.tile_size.pmax
+    sb_p = 128  # nl.tile_size.pmax returns symbolic -1 in torchxla mode
     stride_f = _K_TILE_SZ
 
     kernel_assert(n == _K_TILE_SZ, f"expect to load in tile of size {_K_TILE_SZ=}")
@@ -1846,7 +1857,7 @@ def _load_k_tile(
                 loaded = local_allocator.alloc_sbuf_tensor(shape=(sb_p, num_pe_tps, d), dtype=load_dtype)
                 sbuf_addr_max = max(sbuf_addr_max, local_allocator.get_current_address())
                 tp_dt = load_dtype
-                psum_buf = nl.ndarray((d, num_pe_tps, sb_p), dtype=tp_dt, buffer=nl.psum, address=(0, 0))
+                psum_buf = _psum_ndarray_with_address((d, num_pe_tps, sb_p), tp_dt, (0, 0))
 
                 if load_offset is not None:
                     # NOTE: NKI is incapable of handling both dynamic and constant offsets in IndirectLoad, also it cannot handle

@@ -307,6 +307,10 @@ def get_program_sharding_info() -> Tuple[int, int, int]:
     """
     grid_ndim = nl.program_ndim()
     n_prgs, prg_id = (nl.num_programs(axes=0), nl.program_id(axis=0)) if grid_ndim != 0 else (1, 0)
+    # In torchxla tracing mode, num_programs() may return None even when program_ndim() != 0
+    if n_prgs is None:
+        n_prgs = 1
+        prg_id = 0
     return grid_ndim, n_prgs, prg_id
 
 
