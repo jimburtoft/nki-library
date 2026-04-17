@@ -103,6 +103,7 @@ def attention_block_tkg(
     cos: Optional[nl.ndarray],
     sin: Optional[nl.ndarray],
     rope_contiguous_layout: bool,
+    rotary_dim: Optional[int] = None,
     # -- Q/K processing: post-RoPE RMSNorm
     rmsnorm_QK_post_rope_enabled: bool,
     rmsnorm_QK_post_rope_eps: float,
@@ -336,6 +337,7 @@ def attention_block_tkg(
         KVDP_replica_group,
         out_in_sb,
         skip_attention,
+        rotary_dim=rotary_dim,
     )
 
     B, S_tkg = config['B'], config['S_tkg']
@@ -406,6 +408,7 @@ def attention_block_tkg(
         cos=cos,
         sin=sin,
         rope_contiguous_layout=rope_contiguous_layout,
+        rotary_dim=rotary_dim,
         rmsnorm_post_enabled=rmsnorm_QK_post_rope_enabled,
         rmsnorm_post_eps=rmsnorm_QK_post_rope_eps,
         rmsnorm_post_W_Q=rmsnorm_QK_post_rope_W_Q,
@@ -604,6 +607,7 @@ def _validate_and_extract_config(
     KVDP_replica_group: Optional[ReplicaGroup],
     out_in_sb: bool,
     skip_attention: bool,
+    rotary_dim: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Validate inputs and extract configuration parameters for attention block.
@@ -736,13 +740,14 @@ def _validate_and_extract_config(
 
     # Validate RoPE embeddings
     if cos != None and sin != None:
+        half_rot = (rotary_dim // 2) if rotary_dim is not None else half_d
         kernel_assert(
-            tuple(cos.shape) == (half_d, B, S_tkg),
-            f"cos shape mismatch: expected ({half_d}, {B}, {S_tkg}), got {cos.shape}",
+            tuple(cos.shape) == (half_rot, B, S_tkg),
+            f"cos shape mismatch: expected ({half_rot}, {B}, {S_tkg}), got {cos.shape}",
         )
         kernel_assert(
-            tuple(sin.shape) == (half_d, B, S_tkg),
-            f"sin shape mismatch: expected ({half_d}, {B}, {S_tkg}), got {sin.shape}",
+            tuple(sin.shape) == (half_rot, B, S_tkg),
+            f"sin shape mismatch: expected ({half_rot}, {B}, {S_tkg}), got {sin.shape}",
         )
 
     # KV Quantization
@@ -874,6 +879,7 @@ def _process_head_group(
     sb_cos: Optional[nl.ndarray],
     sb_sin: Optional[nl.ndarray],
     rope_contiguous_layout: bool,
+    rotary_dim: Optional[int],
     rmsnorm_post_enabled: bool,
     rmsnorm_post_eps: float,
     rmsnorm_post_W: Optional[nl.ndarray],
@@ -902,7 +908,9 @@ def _process_head_group(
     if enable_rope:
         out_4d = out.reshape((d, B, n_heads, S))
         out_rope = sbm.alloc_stack(out_4d.shape, dtype=out.dtype, buffer=nl.sbuf)
-        RoPE_sbuf(out_4d, sb_cos, sb_sin, out_rope, convert_from_interleaved=not rope_contiguous_layout)
+        RoPE_sbuf(out_4d, sb_cos, sb_sin, out_rope,
+                  convert_from_interleaved=not rope_contiguous_layout,
+                  rotary_dim=rotary_dim)
         out = out_rope.reshape((d, B * n_heads * S))
 
     # Post-RoPE RMSNorm
@@ -928,6 +936,7 @@ def _QKV_processing(
     cos: Optional[nl.ndarray],
     sin: Optional[nl.ndarray],
     rope_contiguous_layout: bool,
+    rotary_dim: Optional[int],
     rmsnorm_post_enabled: bool,
     rmsnorm_post_eps: float,
     rmsnorm_post_W_Q: Optional[nl.ndarray],
@@ -1012,9 +1021,9 @@ def _QKV_processing(
         # Slice cos/sin for this tile (copy to fresh buffer — RoPE_sbuf can't use indexed tensors)
         tile_cos, tile_sin = None, None
         if enable_rope:
-            half_d = d_head // 2
-            tile_cos = sbm.alloc_stack((half_d, tile_B, S_tkg), dtype=sb_cos.dtype, buffer=nl.sbuf)
-            tile_sin = sbm.alloc_stack((half_d, tile_B, S_tkg), dtype=sb_sin.dtype, buffer=nl.sbuf)
+            half_rot = sb_cos.shape[0]  # rotary_dim//2 (may differ from d_head//2 for partial RoPE)
+            tile_cos = sbm.alloc_stack((half_rot, tile_B, S_tkg), dtype=sb_cos.dtype, buffer=nl.sbuf)
+            tile_sin = sbm.alloc_stack((half_rot, tile_B, S_tkg), dtype=sb_sin.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(tile_cos, sb_cos[:, nl.ds(tile_start // S_tkg, tile_B), :])
             nisa.tensor_copy(tile_sin, sb_sin[:, nl.ds(tile_start // S_tkg, tile_B), :])
 
@@ -1033,6 +1042,7 @@ def _QKV_processing(
             sb_cos=tile_cos,
             sb_sin=tile_sin,
             rope_contiguous_layout=rope_contiguous_layout,
+            rotary_dim=rotary_dim,
             rmsnorm_post_enabled=rmsnorm_post_enabled,
             rmsnorm_post_eps=rmsnorm_post_eps,
             rmsnorm_post_W=rmsnorm_post_W_Q,
@@ -1059,6 +1069,7 @@ def _QKV_processing(
             sb_cos=tile_cos,
             sb_sin=tile_sin,
             rope_contiguous_layout=rope_contiguous_layout,
+            rotary_dim=rotary_dim,
             rmsnorm_post_enabled=rmsnorm_post_enabled,
             rmsnorm_post_eps=rmsnorm_post_eps,
             rmsnorm_post_W=rmsnorm_post_W_K,
