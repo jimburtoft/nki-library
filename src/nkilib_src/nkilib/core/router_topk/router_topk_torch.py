@@ -41,6 +41,8 @@ def router_topk_torch_ref(
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
     x_input_in_sbuf: bool = False,
+    selection_bias: torch.Tensor = None,
+    routed_scaling_factor: float = None,
 ):
     """
     PyTorch reference implementation for router top-K kernel.
@@ -59,6 +61,11 @@ def router_topk_torch_ref(
         router_pre_norm: If True, apply activation before top-K
         norm_topk_prob: If True, normalize top-K probabilities with L1 norm
         x_input_in_sbuf: If True, x is in SBUF (affects layout interpretation)
+        selection_bias: Optional [1, E] or [E] tensor added to activated scores for
+            expert selection only. The gathered affinities use unbiased scores.
+            Used by GLM-5/DeepSeek-V3 routing (e_score_correction_bias).
+        routed_scaling_factor: Optional float multiplied into affinities after L1
+            normalization. Used by GLM-5 (2.5) / DeepSeek-V3 (2.827).
 
     Returns:
         dict: Dictionary containing 'router_logits', 'expert_index', and 'expert_affinities' as torch tensors
@@ -79,10 +86,6 @@ def router_topk_torch_ref(
     # Get dimensions
     T, E = router_logits_out.shape
 
-    # Get top-K indices
-    ind = torch.argsort(-router_logits_out, dim=-1)
-    expert_index_out = ind[..., :k]  # [T, k]
-
     # Compute expert affinities based on router_pre_norm flag
     if router_pre_norm:
         # ACT1 pipeline: activate full logits, then select top-K
@@ -93,8 +96,21 @@ def router_topk_torch_ref(
         else:
             raise NotImplementedError(f"Unsupported activation function: {act_fn}")
 
+        # Determine top-K selection input:
+        # If selection_bias is provided (GLM-5/DeepSeek-V3 pattern), add it to the
+        # activated scores for expert selection only. The gathered affinities use
+        # the unbiased activated scores.
+        if selection_bias is not None:
+            topk_selection_input = expert_affinities_full + selection_bias
+        else:
+            topk_selection_input = expert_affinities_full
+
+        # Get top-K indices from selection input
+        ind = torch.argsort(-topk_selection_input, dim=-1)
+        expert_index_out = ind[..., :k]  # [T, k]
+
         if norm_topk_prob:
-            # Scatter top-K values and normalize
+            # Scatter top-K values (from UNBIASED affinities) and normalize
             expert_affinities_select = torch.zeros((T, E))
             for token_idx in range(T):
                 for topk_idx in range(k):
@@ -103,10 +119,18 @@ def router_topk_torch_ref(
 
             # L1 normalization per token
             expert_affinities_out = expert_affinities_select / torch.sum(expert_affinities_select, dim=1, keepdim=True)
+
+            # Apply routed_scaling_factor after normalization (GLM-5/DeepSeek-V3 pattern)
+            if routed_scaling_factor is not None:
+                expert_affinities_out = expert_affinities_out * routed_scaling_factor
         else:
             expert_affinities_out = expert_affinities_full
     else:
-        # ACT2 pipeline: gather top-K, activate, then scatter
+        # ACT2 pipeline: gather top-K from raw logits, activate, then scatter
+        # selection_bias not applicable here (requires router_pre_norm=True)
+        ind = torch.argsort(-router_logits_out, dim=-1)
+        expert_index_out = ind[..., :k]  # [T, k]
+
         top_k_values = torch.zeros((T, k))
         for token_idx in range(T):
             for topk_idx in range(k):

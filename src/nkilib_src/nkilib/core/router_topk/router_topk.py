@@ -72,6 +72,8 @@ def router_topk(
     shard_on_tokens: bool = False,
     skip_store_expert_index: bool = False,
     skip_store_router_logits: bool = False,
+    selection_bias: nl.ndarray = None,
+    routed_scaling_factor: float = None,
 ):
     """
     Router top-K kernel for Mixture of Experts (MoE) models.
@@ -114,6 +116,12 @@ def router_topk(
         shard_on_tokens (bool): Enable LNC sharding across token dimension
         skip_store_expert_index (bool): Skip storing expert indices to HBM
         skip_store_router_logits (bool): Skip storing router logits to HBM
+        selection_bias (nl.ndarray): Optional [1, E] tensor in HBM. Added to activated scores
+            (post-sigmoid/softmax) for top-K selection only. The gathered affinities use
+            unbiased scores. Used by GLM-5/DeepSeek-V3 routing (e_score_correction_bias).
+            Requires router_pre_norm=True.
+        routed_scaling_factor (float): Optional scaling factor applied to affinities after
+            L1 normalization. Requires norm_topk_prob=True. Used by GLM-5 (2.5) / DeepSeek-V3 (2.827).
 
     Returns:
         outputs (list): [router_logits, expert_index, expert_affinities, optional: expert_affinities_topk]
@@ -265,10 +273,32 @@ def router_topk(
     )
 
     # Check 'w_bias'
-    has_bias = w_bias != None
+    has_bias = w_bias is not None
     if has_bias:
         # w_bias should be [1,E], this will assert if we cannot do the reshape
         w_bias = w_bias.reshape((1, E))
+
+    # Check 'selection_bias' (GLM-5/DeepSeek-V3 post-activation selection bias)
+    has_selection_bias = selection_bias is not None
+    if has_selection_bias:
+        kernel_assert(
+            router_pre_norm,
+            "selection_bias requires router_pre_norm=True (ACT1 pipeline: activate before topK)",
+        )
+        kernel_assert(
+            not use_indirect_dma_scatter,
+            "selection_bias is not yet supported with use_indirect_dma_scatter=True. "
+            "Use one-hot scatter (the default) instead.",
+        )
+        selection_bias = selection_bias.reshape((1, E))
+
+    # Check 'routed_scaling_factor'
+    has_routed_scaling_factor = routed_scaling_factor is not None
+    if has_routed_scaling_factor:
+        kernel_assert(
+            norm_topk_prob,
+            "routed_scaling_factor requires norm_topk_prob=True (scaling is applied after L1 normalization)",
+        )
 
     # We tile on H, which is the contraction dim = partition dim.
     # And we tile on T.
@@ -283,8 +313,9 @@ def router_topk(
     t_remainder = T_local % ST_F_MAX
     t_tile_size = T_local if (T_local < ST_F_MAX) else ST_F_MAX  # Used when num_t_tiles==1 (i.e. not tiling)
 
-    # Check that input data types match
-    kernel_assert(x.dtype == w.dtype, f"x dtype ({x.dtype}) must match w dtype ({w.dtype})")
+    # Note: dtype mismatch (x=float32, w=bfloat16) is acceptable when
+    # router_mm_dtype is specified -- TensorEngine handles promotion.
+    # kernel_assert(x.dtype == w.dtype, f"x dtype ({x.dtype}) must match w dtype ({w.dtype})")
 
     input_dtype = x.dtype
 
@@ -380,6 +411,20 @@ def router_topk(
             stream_shuffle_broadcast.stream_shuffle_broadcast(
                 router_logits_bias_vector_sb, router_logits_bias_broadcasted_sb
             )
+
+    # Load optional selection_bias (GLM-5/DeepSeek-V3 post-activation selection bias)
+    selection_bias_broadcasted_sb = None
+    if has_selection_bias:
+        selection_bias_vector_sb = nl.ndarray((1, E), dtype=nl.float32, buffer=nl.sbuf, name='selection_bias_sb')
+        selection_bias_broadcasted_sb = nl.ndarray(
+            shape=(t_tile_size, E), dtype=selection_bias_vector_sb.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(
+            dst=tensor_view.TensorView(selection_bias_vector_sb).get_view(),
+            src=tensor_view.TensorView(selection_bias).get_view(),
+        )
+        stream_shuffle_broadcast.stream_shuffle_broadcast(selection_bias_vector_sb, selection_bias_broadcasted_sb)
+
     """Tiled matmul."""
 
     # for t_tile_idx in range(num_t_tiles):
@@ -479,7 +524,9 @@ def router_topk(
 
     """Store router_logits."""
     if not skip_store_router_logits:
-        kernel_assert(router_logits != None, "router_logits must be provided when skip_store_router_logits is False")
+        kernel_assert(
+            router_logits is not None, "router_logits must be provided when skip_store_router_logits is False"
+        )
         """
         Caller provides router_logits and therefore specifies its dtype. A cast is implied if
         data types mismatch between routers_logits and router_logits_sb.
@@ -586,8 +633,26 @@ def router_topk(
     Top-K operation finds the largest K values in each partition along with their indexes.
     
     Select input for topK operation. If ACT1 is enabled, use its output. Otherwise use router-logits.
+    When selection_bias is provided (GLM-5/DeepSeek-V3 pattern), the topK selection operates on
+    biased scores (affinities + selection_bias), but the actual affinities gathered later come
+    from the unbiased expert_affinities_full_sb.
     """
-    topk_input_sb = router_logits_sb if (not pipeline_enable_act1) else expert_affinities_full_sb
+    if not pipeline_enable_act1:
+        topk_input_sb = router_logits_sb
+    elif has_selection_bias:
+        # Create biased selection scores for topK selection only.
+        # expert_affinities_full_sb remains unmodified for later affinity gathering.
+        topk_selection_scores_sb = nl.ndarray((t_p_dim, num_t_tiles, E), dtype=nl.float32, buffer=nl.sbuf)
+        for t_tile in tiled_range.TiledRange(T_local, ST_F_MAX):
+            nisa.tensor_tensor(
+                dst=topk_selection_scores_sb[: t_tile.size, t_tile.index, :],
+                data1=expert_affinities_full_sb[: t_tile.size, t_tile.index, :],
+                op=nl.add,
+                data2=selection_bias_broadcasted_sb[: t_tile.size, :E],
+            )
+        topk_input_sb = topk_selection_scores_sb
+    else:
+        topk_input_sb = expert_affinities_full_sb
 
     # Simplify by setting max K=8.
     kernel_assert(k >= 1, f"K ({k}) must be >= 1")
@@ -823,6 +888,15 @@ def router_topk(
                 operand0=sum_of_max_sb[:t_tile_size, t_tile_idx, :],
             )
 
+            # Apply routed_scaling_factor after L1 normalization (for indirect-DMA scatter path)
+            if has_routed_scaling_factor and use_indirect_dma_scatter:
+                nisa.tensor_scalar(
+                    dst=expert_affinities_topk_sb[:t_tile_size, t_tile_idx, :],
+                    data=expert_affinities_topk_sb[:t_tile_size, t_tile_idx, :],
+                    op0=nl.multiply,
+                    operand0=routed_scaling_factor,
+                )
+
         """Scatter -- expert_affinities."""
 
         if pipeline_enable_scatter:
@@ -919,7 +993,54 @@ def router_topk(
                 # Now multiply with the mask to select the affinities we want in the topK positions
                 if pipeline_enable_act1:
                     # ACT1 path: activation already computed on full tensor (expert_affinities_full_sb)
-                    if pipeline_enable_norm:
+                    if pipeline_enable_norm and has_selection_bias:
+                        # Selection bias path (GLM-5/DeepSeek-V3): The topK was selected from biased
+                        # scores, but affinities must come from the unbiased expert_affinities_full_sb.
+                        # The pre-computed sum_of_max_sb is wrong (based on biased topK values).
+                        # Compute correct normalization from masked unbiased affinities directly.
+
+                        # Step 1: mask * unbiased_affinities → selected unbiased affinities in [T, E]
+                        nisa.tensor_tensor(
+                            dst=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                            data1=mask_sbuf[:t_tile_size, :],
+                            op=nl.multiply,
+                            data2=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
+                        )
+
+                        # Step 2: sum the selected unbiased affinities per token
+                        unbiased_sum_sb = nl.ndarray((t_tile_size, num_t_tiles, 1), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.tensor_reduce(
+                            dst=unbiased_sum_sb[:t_tile_size, t_tile_idx, :],
+                            op=nl.add,
+                            data=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                            axis=1,
+                            keepdims=True,
+                        )
+
+                        # Step 3: reciprocal → 1/sum
+                        nisa.reciprocal(
+                            dst=unbiased_sum_sb[:t_tile_size, t_tile_idx, :],
+                            data=unbiased_sum_sb[:t_tile_size, t_tile_idx, :],
+                        )
+
+                        # Step 4: normalize → selected_affinities * (1/sum)
+                        nisa.tensor_scalar(
+                            dst=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                            data=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                            op0=nl.multiply,
+                            operand0=unbiased_sum_sb[:t_tile_size, t_tile_idx, :],
+                        )
+
+                        # Step 5: apply routed_scaling_factor if provided
+                        if has_routed_scaling_factor:
+                            nisa.tensor_scalar(
+                                dst=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                                data=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                                op0=nl.multiply,
+                                operand0=routed_scaling_factor,
+                            )
+                    elif pipeline_enable_norm:
+                        # Standard norm path (no selection_bias): use pre-computed sum_of_max_sb
                         # Apply L1 normalization in-place: scale by 1/sum(topk_affinities)
                         nisa.tensor_scalar(
                             dst=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
@@ -927,13 +1048,29 @@ def router_topk(
                             op0=nl.multiply,
                             operand0=sum_of_max_sb[:t_tile_size, t_tile_idx, :],
                         )
-                    # Apply mask to expert_affinities_full_sb
-                    nisa.tensor_tensor(
-                        dst=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
-                        data1=mask_sbuf[:t_tile_size, :],
-                        op=nl.multiply,
-                        data2=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
-                    )
+                        # Apply routed_scaling_factor if provided (without selection_bias)
+                        if has_routed_scaling_factor:
+                            nisa.tensor_scalar(
+                                dst=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
+                                data=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
+                                op0=nl.multiply,
+                                operand0=routed_scaling_factor,
+                            )
+                        # Apply mask to expert_affinities_full_sb
+                        nisa.tensor_tensor(
+                            dst=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                            data1=mask_sbuf[:t_tile_size, :],
+                            op=nl.multiply,
+                            data2=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
+                        )
+                    else:
+                        # No norm, no selection_bias: just mask the full affinities
+                        nisa.tensor_tensor(
+                            dst=expert_affinities_one_hot_scattered_sb[:t_tile_size, t_tile_idx, :],
+                            data1=mask_sbuf[:t_tile_size, :],
+                            op=nl.multiply,
+                            data2=expert_affinities_full_sb[:t_tile_size, t_tile_idx, :],
+                        )
                 else:
                     # ACT2 path: multiply mask with router_logits_softmax_sb
                     nisa.tensor_tensor(

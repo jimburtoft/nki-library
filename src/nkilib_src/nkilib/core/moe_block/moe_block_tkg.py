@@ -72,6 +72,8 @@ def moe_block_tkg(
     is_all_expert: bool = False,
     rank_id: Optional[nl.ndarray] = None,
     residual: Optional[nl.ndarray] = None,
+    selection_bias: Optional[nl.ndarray] = None,
+    routed_scaling_factor: Optional[float] = None,
 ):
     """
     Unified MoE Block kernel for token generation supporting selective-expert and all-expert modes.
@@ -135,6 +137,12 @@ def moe_block_tkg(
         rank_id (nl.ndarray): [1, 1], Worker rank for expert sharding. Required when is_all_expert=True.
         residual (nl.ndarray): [B, S, H] or [T, H], Optional residual tensor for fused residual add.
             Only supported for MXFP in all_expert mode.
+        selection_bias (nl.ndarray): [1, E], Optional post-activation bias for expert selection.
+            Added to activated scores (post-sigmoid/softmax) for top-K selection only. The gathered
+            affinities use unbiased scores. Used by GLM-5/DeepSeek-V3 (e_score_correction_bias).
+            Requires router_pre_norm=True and norm_topk_prob=True.
+        routed_scaling_factor (float): Optional scaling factor applied to affinities after L1
+            normalization. Requires norm_topk_prob=True. Used by GLM-5 (2.5) / DeepSeek-V3 (2.827).
 
     Returns:
         out (nl.ndarray): [T, H], Output tensor of the kernel.
@@ -201,7 +209,9 @@ def moe_block_tkg(
         quant_shape = (_pmax, num_H512_tiles, dims.T)
         rmsnorm_out_quant = nl.ndarray(quant_shape, dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
         rmsnorm_out_scale = nl.ndarray(quant_shape, dtype=nl.uint8, buffer=nl.sbuf)
-        residual_out = nl.ndarray((dims.T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm) if residual != None else None
+        residual_out = (
+            nl.ndarray((dims.T, dims.H), dtype=inp.dtype, buffer=nl.shared_hbm) if residual is not None else None
+        )
 
         _rmsnorm_mx_quantize_tkg(
             input=inp,
@@ -287,6 +297,8 @@ def moe_block_tkg(
         shard_on_tokens=is_mxfp_all_expert or (not expert_config.is_all_expert and dims.T > 1),
         skip_store_expert_index=skip_store_expert_index,
         skip_store_router_logits=skip_router_logits,
+        selection_bias=selection_bias,
+        routed_scaling_factor=routed_scaling_factor,
     )
     router_logits, expert_index, expert_affinities = router_outputs[0], router_outputs[1], router_outputs[2]
     if not expert_config.is_all_expert and quant_config.is_moe_weight_mx:
@@ -343,7 +355,7 @@ def moe_block_tkg(
     outputs = [result]
     if not skip_router_logits:
         outputs.append(router_logits)
-    if residual_out != None:
+    if residual_out is not None:
         outputs.append(residual_out)
 
     return tuple(outputs)
