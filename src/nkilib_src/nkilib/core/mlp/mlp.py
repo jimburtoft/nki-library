@@ -200,18 +200,6 @@ def mlp(
         - Standard matrix multiplication layouts
     """
 
-        TKG mode supports:
-        - FP8 quantization (tensor-wise and row-wise)
-        - MXFP quantization (MXFP4 and MXFP8) - TKG only
-        - Column tiling optimizations
-        - Tensor layout optimization for down projection
-        - Input in SBUF for kernel fusion
-
-        CTE mode supports:
-        - FP8 quantization (tensor-wise and row-wise)
-        - Standard matrix multiplication layouts
-    """
-
     # Build MLP parameter object with all relevant weights, biases, and config
     mlp_params = MLPParameters(
         hidden_tensor=hidden_tensor,

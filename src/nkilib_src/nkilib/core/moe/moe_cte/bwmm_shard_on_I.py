@@ -65,6 +65,7 @@ class DimensionSizes(NKIObject):
     N: int
     I_TP: int
     I_TP_sharded: int
+    I_TP_sharded_padded: int
     GUP_N_TILES: int
 
     def derive_all_dims(self):
@@ -80,7 +81,10 @@ class DimensionSizes(NKIObject):
         )
         self.NUM_DYNAMIC_BLOCKS = self.N - self.NUM_STATIC_BLOCKS
         self.I_TP_sharded = self.I_TP // self.NUM_SHARDS
-        self.GUP_N_TILES = div_ceil(self.I_TP_sharded, TILE_SIZE)
+        # Pad to at least TILE_SIZE for nc_matmul partition/free dimension alignment.
+        # When I_TP_sharded < TILE_SIZE, zero-padded weight lanes produce zero contributions.
+        self.I_TP_sharded_padded = max(self.I_TP_sharded, TILE_SIZE)
+        self.GUP_N_TILES = div_ceil(self.I_TP_sharded_padded, TILE_SIZE)
 
 
 @nki.jit(mode="trace")
@@ -280,7 +284,7 @@ def blockwise_mm_baseline_shard_intermediate(
         linear_bias=(gate_and_up_proj_bias != None and down_proj_bias != None),
         activation_function=activation_function,
         is_quant=gate_up_proj_scale != None and down_proj_scale != None,
-        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded <= FUSE_GATE_WEIGHT_SIZE),
+        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded_padded <= FUSE_GATE_WEIGHT_SIZE),
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
@@ -530,7 +534,7 @@ def blockwise_mm_baseline_shard_intermediate_hybrid(
         linear_bias=(gate_and_up_proj_bias != None and down_proj_bias != None),
         activation_function=activation_function,
         is_quant=(gate_up_proj_scale != None and down_proj_scale != None),
-        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded <= FUSE_GATE_WEIGHT_SIZE),
+        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded_padded <= FUSE_GATE_WEIGHT_SIZE),
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
@@ -854,7 +858,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
     intermediate_states = compute_intermediate_states(
         gate_and_up_proj_states=gate_and_up_proj_states,
         B=dims.B,
-        I_TP=dims.I_TP_sharded,
+        I_TP=dims.I_TP_sharded_padded,
         dtype=cfg.compute_dtype,
         activation_function=cfg.activation_function,
         expert_affinity_T_broadcasted=expert_affinity_T_broadcasted,
@@ -930,7 +934,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
     """
 
     N_PSUM_TILE = div_ceil(dims.B, PSUM_SIZE)
-    GUP_N_TILES = div_ceil(dims.I_TP_sharded, TILE_SIZE)
+    GUP_N_TILES = div_ceil(dims.I_TP_sharded_padded, TILE_SIZE)
     h_inner_tripcount = PSUM_SIZE // TILE_SIZE
 
     free_size = block_hidden_states_T[0][0].shape[-1]
@@ -947,7 +951,10 @@ def compute_gate_and_up_projections_shard_on_intermediate(
         gate_and_up_proj_res_sbuf_lst.append(psum_lst)
 
     if cfg.linear_bias:
-        gate_up_bias = nl.ndarray((2, dims.I_TP_sharded), dtype=cfg.compute_dtype, buffer=nl.sbuf)
+        # Pad allocation to at least TILE_SIZE so nc_transpose reads don't overflow.
+        # Zero-init so padded positions (I_TP_sharded..I_TP_sharded_padded) contribute zero bias.
+        gate_up_bias = nl.ndarray((2, dims.I_TP_sharded_padded), dtype=cfg.compute_dtype, buffer=nl.sbuf)
+        nisa.memset(dst=gate_up_bias, value=0)
         gate_up_bias_T = nl.ndarray((TILE_SIZE, 2 * GUP_N_TILES), dtype=cfg.compute_dtype, buffer=nl.sbuf)
 
         _, _, I_TP_total = inps.gate_and_up_proj_bias.shape
@@ -1001,7 +1008,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
 
         for i_tile_idx in range(GUP_N_TILES):
             i_start = TILE_SIZE * i_tile_idx
-            num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
+            num_i_tile = min(TILE_SIZE, dims.I_TP_sharded_padded - TILE_SIZE * i_tile_idx)
 
             for h_outer_idx in range(h_outer_tripcount):
                 for h_inner_idx in range(h_inner_tripcount):
@@ -1121,7 +1128,7 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                             ],
                         )
                     else:
-                        num_i_tile = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_tile_idx)
+                        num_i_tile = min(TILE_SIZE, dims.I_TP_sharded_padded - TILE_SIZE * i_tile_idx)
                         nisa.tensor_copy(
                             dst=gate_and_up_proj_res_sbuf_lst[gate_or_up][psum_tile_idx][i_tile_idx][
                                 0:num_i_tile, 0:free_size
@@ -1264,6 +1271,7 @@ def load_gate_up_proj_weights_shard_intermediate(
 
     _, H, _, _I_TP = gate_up_proj_weight.shape
     I_TP_per_shard = _I_TP // num_shards
+    I_TP_per_shard_padded = max(I_TP_per_shard, TILE_SIZE)
     I_TP_offset = I_TP_per_shard * shard_id
     h_outer_tripcount = div_ceil(H, PSUM_SIZE)
     h_inner_tripcount = PSUM_SIZE // TILE_SIZE
@@ -1273,9 +1281,10 @@ def load_gate_up_proj_weights_shard_intermediate(
         for h_i in range(h_outer_tripcount):
             h_j_lst = []
             for h_j in range(h_inner_tripcount):
-                h_j_lst.append(
-                    nl.ndarray((TILE_SIZE, N_WEIGHTS, I_TP_per_shard), dtype=cfg.weight_dtype, buffer=nl.sbuf)
-                )
+                buf = nl.ndarray((TILE_SIZE, N_WEIGHTS, I_TP_per_shard_padded), dtype=cfg.weight_dtype, buffer=nl.sbuf)
+                # Zero-init padded weight buffer to prevent uninitialized data in padded positions
+                nisa.memset(dst=buf, value=0)
+                h_j_lst.append(buf)
             load_dst.append(h_j_lst)
 
     for h_i in range(h_outer_tripcount):
@@ -1564,13 +1573,16 @@ def compute_down_proj_shard_on_intermediate(
     for b_tile_idx in range(dims.NUM_B_TILES_SHARDED):
         block_new_lnc_recv_sbuf_lst.append(nl.ndarray((TILE_SIZE, dims.H), dtype=cfg.io_dtype, buffer=nl.sbuf))
 
-    GUP_N_TILES = div_ceil(dims.I_TP_sharded, TILE_SIZE)
+    GUP_N_TILES = div_ceil(dims.I_TP_sharded_padded, TILE_SIZE)
     H_tile_size = min(1024, dims.H)
     h_i_upper = div_ceil(dims.H, H_tile_size)
 
     dp_load_dst_lst = []
     for i_tile_idx in range(GUP_N_TILES):
-        dp_load_dst_lst.append(nl.ndarray((TILE_SIZE, H_tile_size), dtype=inps.down_proj_weight.dtype, buffer=nl.sbuf))
+        buf = nl.ndarray((TILE_SIZE, H_tile_size), dtype=inps.down_proj_weight.dtype, buffer=nl.sbuf)
+        # Zero-init padded weight buffer to prevent uninitialized data in padded positions
+        nisa.memset(dst=buf, value=0)
+        dp_load_dst_lst.append(buf)
 
     for H_tile1024_idx in nl.sequential_range(h_i_upper):
         actual_H_tile_size = min(H_tile_size, dims.H - H_tile_size * H_tile1024_idx)
@@ -1622,9 +1634,7 @@ def compute_down_proj_shard_on_intermediate(
             for h_j in range(num_h_tiles):
                 num_h_elems = min(PSUM_SIZE, dims.H - (H_tile_size * H_tile1024_idx + PSUM_SIZE * h_j))
                 for i_i in range(GUP_N_TILES):
-                    num_i_elems = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_i)
-
-                    # dp_weights[i_i] has shape (TILE_SIZE, H_tile_size)
+                    num_i_elems = min(TILE_SIZE, dims.I_TP_sharded_padded - TILE_SIZE * i_i)
                     # We're accessing [i, PSUM_SIZE*h_j + j] for i in 0:num_i_elems, j in 0:num_h_elems
                     # Pattern: [[H_tile_size, num_i_elems], [1, num_h_elems]]
                     # Offset: PSUM_SIZE * h_j
@@ -1795,12 +1805,15 @@ def load_down_proj_weight_shard_intermediate_H_tile(
     _, _I_TP, _H = down_proj_weight.shape
     I_TP_sharded = _I_TP // num_shards
     I_TP_offset = I_TP_sharded * shard_id
-    GUP_N_TILES = div_ceil(I_TP_sharded, TILE_SIZE)
+    GUP_N_TILES = div_ceil(max(I_TP_sharded, TILE_SIZE), TILE_SIZE)
 
     if dp_load_dst != None:
         dp_load_dst = []
         for i_tile_idx in range(GUP_N_TILES):
-            dp_load_dst.append(nl.ndarray((TILE_SIZE, H_tile_size), dtype=cfg.weight_dtype, buffer=nl.sbuf))
+            buf = nl.ndarray((TILE_SIZE, H_tile_size), dtype=cfg.weight_dtype, buffer=nl.sbuf)
+            # Zero-init padded weight buffer to prevent uninitialized data in padded positions
+            nisa.memset(dst=buf, value=0)
+            dp_load_dst.append(buf)
 
     for i_tile_idx in range(GUP_N_TILES):
         num_p = min(TILE_SIZE, _I_TP - (TILE_SIZE * i_tile_idx + I_TP_offset))
@@ -1946,7 +1959,7 @@ def compute_one_block_dropping(
         intermediate_states = compute_intermediate_states(
             gate_and_up_proj_states=gate_and_up_proj_states,
             B=dims.B,
-            I_TP=dims.I_TP_sharded,
+            I_TP=dims.I_TP_sharded_padded,
             dtype=cfg.compute_dtype,
             activation_function=cfg.activation_function,
             expert_affinity_T_broadcasted=expert_affinity_T_broadcasted,
@@ -2113,7 +2126,7 @@ def blockwise_mm_shard_intermediate_dropping(
         linear_bias=(gate_and_up_proj_bias is not None and down_proj_bias is not None),
         activation_function=activation_function,
         is_quant=(gate_up_proj_scale is not None and down_proj_scale is not None),
-        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded <= FUSE_GATE_WEIGHT_SIZE),
+        fuse_gate_and_up_load=(dims.H * dims.I_TP_sharded_padded <= FUSE_GATE_WEIGHT_SIZE),
         gate_clamp_upper_limit=gate_clamp_upper_limit,
         gate_clamp_lower_limit=gate_clamp_lower_limit,
         up_clamp_lower_limit=up_clamp_lower_limit,
