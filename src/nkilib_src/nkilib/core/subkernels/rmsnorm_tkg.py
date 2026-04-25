@@ -364,7 +364,11 @@ def _process_rmsnorm_tile(
         name=f"rmsnorm_reduced_square_{bxs_tile.index}",
     )
     num_allocated_tensor += 1
-    nisa.tensor_reduce(rmsnorm_reduced_square[...], nl.add, rmsnorm_square[...], axis=2)
+    # SDK 2.28 tensor_reduce only supports reducing the first free axis (axis=1).
+    # To reduce the last free axis (H1, axis=2), we permute (H0, BxS, H1) -> (H0, H1, BxS)
+    # so that H1 becomes axis=1, then reduce axis=1. The permute is zero-cost metadata only.
+    rmsnorm_square_permuted = TensorView(rmsnorm_square).permute((0, 2, 1))
+    nisa.tensor_reduce(rmsnorm_reduced_square[...], nl.add, rmsnorm_square_permuted.get_view(), axis=1)
 
     if shard_on_h:
         _, _, shard_id = get_verified_program_sharding_info("rmsnorm_tkg", (0, 1))
