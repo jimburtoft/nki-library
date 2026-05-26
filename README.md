@@ -1,4 +1,57 @@
-# NKI Library
+# NKI Library (GLM-5 Fork)
+
+> **This is a fork of [aws-neuron/nki-library](https://github.com/aws-neuron/nki-library) on branch `feature/selection-bias-routing`.**
+> **Based on SDK 2.29 nkilib (commit `d2ad3a5`, "NKI Lib 2026-04-13").**
+
+## Fork Purpose
+
+This fork adds **post-activation selection bias** and **routed scaling factor** support to the `router_topk` and `moe_block_tkg` kernels for GLM-5 (and DeepSeek-V3 style) MoE routing.
+
+### Modified Files (4 files, 1 commit: `dc74d3d`)
+
+| File | Change |
+|------|--------|
+| `src/nkilib_src/nkilib/core/router_topk/router_topk.py` | Added `selection_bias` param (post-sigmoid, pre-TopK) and `routed_scaling_factor` (post-L1-norm scaling) |
+| `src/nkilib_src/nkilib/core/router_topk/router_topk_torch.py` | PyTorch reference implementation matching NKI kernel |
+| `src/nkilib_src/nkilib/core/moe_block/moe_block_tkg.py` | Pass `selection_bias` and `routed_scaling_factor` through to `router_topk` |
+| `src/nkilib_src/nkilib/core/subkernels/rmsnorm_tkg.py` | NKI 0.3.0 `tensor_reduce` axis fix (later reverted -- NKI 0.3.0 supports `axis=2` natively) |
+
+### Why This Fork Is Needed
+
+Upstream nkilib's `router_bias` (`w_bias`) is a **pre-activation** bias added to raw logits before sigmoid. GLM-5 requires a **post-activation** selection bias:
+
+```python
+# Upstream: sigmoid(logits + w_bias) -- bias changes BOTH selection AND weights
+# GLM-5:   selection_scores = sigmoid(logits) + selection_bias  -- bias only for TopK selection
+#           weights = sigmoid(logits)[topk_indices]             -- UN-BIASED values for weighting
+```
+
+These are mathematically different (`sigmoid(x+b) != sigmoid(x) + b`). The upstream `router_bias` cannot replicate GLM-5's routing behavior where the bias influences which experts are selected but does NOT affect the affinity weights used for combining expert outputs.
+
+### SDK 2.29 vs 2.30 Analysis (2026-05-26)
+
+This fork is based on SDK 2.29 kernels. The 2.30 upstream (`origin/main`) has significant changes, but **none provide performance improvements for GLM-5's code path**:
+
+| Category | SDK 2.30 Changes | Impact for GLM-5 |
+|----------|-----------------|-------------------|
+| **MoE TKG (non-MX path)** | Refactored into helper functions (`load_all_expert_affinities`, `broadcast_all_expert_affinity`, etc.), `safe_tensor_view` wrappers, `transposed_out` support | **No perf change** -- same algorithm, same DMA patterns |
+| **MoE TKG (MX path)** | Matmul loop reorder (H->I->4_I), pre-allocated PSUM, STATIC_MX/ROW_MX modes, `.view()` bitcasts | **Not applicable** -- GLM-5 uses standard FP8, not MX-packed weights |
+| **Router TopK** | +31/-19 lines: `@nki.jit` decorator, `skip_store_router_logits` allowed | **No perf change** |
+| **MoE Block TKG** | +178/-29 lines: `is_all_expert_dynamic`, `block_size`, `inp_layout`/`outp_layout` enums | **Not applicable** at BS=1 (T=1 doesn't meet dynamic mode requirements) |
+| **RMSNorm TKG** | New `rmsnorm_tkg_th` (T-on-partition layout), `_rmsnorm_tkg_dloc` (dynamic mode) | **Not applicable** -- GLM-5 uses existing layout |
+| **gen4 assertion** | MX weights restricted to Trn3+ (`nisa.get_nc_version() >= gen4`) | **Not applicable** -- GLM-5 doesn't use MX weights |
+
+**Decision: Remain on SDK 2.29 kernels.** Rebasing onto 2.30 would require resolving conflicts across hundreds of lines of refactoring for zero performance benefit on GLM-5's code path (non-MX `_all_expert_moe_tkg` with standard FP8 per-tensor-symmetric quantization).
+
+### When to Rebase onto 2.30+
+
+Consider rebasing if:
+1. Upstream adds native `selection_bias` support (post-activation, pre-TopK)
+2. GLM-5 moves to MXFP4/MXFP8 quantization (would benefit from MX path optimizations)
+3. GLM-5 moves to Trn3 (hardware MX acceleration)
+4. A bug fix in 2.30 affects GLM-5's code path
+
+---
 
 The NKI Library provides pre-built reference kernels you can use directly in your model development with the AWS Neuron SDK and NKI.
 These kernel APIs provide the default classes, functions, and parameters you can use to integrate the NKL kernels into your models.
