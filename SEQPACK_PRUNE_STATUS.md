@@ -1,9 +1,9 @@
 # Sequence-packing tile pruning -- status
 
-**Correct and hardware-validated for seqlen <= 8192. Multi-section (seqlen > 8192) is a known gap.**
+**Correct and hardware-validated, including multi-section (seqlen > 8192).**
 
-Supersedes the earlier `HW_VALIDATION_WARNING.md`: the numerically-broken per-tile
-implementation has been replaced.
+Supersedes the earlier `HW_VALIDATION_WARNING.md`. The multi-section gap noted in the previous
+revision of this file is now **fixed**.
 
 ## What works
 
@@ -21,8 +21,20 @@ Hardware-verified on trn2.3xlarge (DLAMI 20260818 / SDK 2.32, neuronx-cc 2.27.53
 | 4096 unaligned [1500,1300,796,500] | 1.41x | **1.19x** | 85% | yes |
 | 4096 single segment (control) | 1.00x | 1.00x | - | yes |
 
-`test_attention_cte_seqpack_prune.py`: **35 passed, 1 xfailed**, including 20 device
-output-neutrality cases across LNC=1 and LNC=2.
+**Multi-section (this is where it matters -- the customer targets 128K via context parallelism,
+so per-rank lengths are the relevant shapes):**
+
+| Config | sections | MAC ratio | **wall-clock** | bit-identical |
+|---|---|---|---|---|
+| 16384 = 16 x 1024 (CP=8 rank of 128K) | 2 | 3.53x | **2.93x** | yes (0/128 groups differ) |
+| 32768 = 32 x 1024 (CP=4 rank of 128K) | 4 | **7.07x** | **5.95x** | yes (0/256 groups differ) |
+
+Savings grow with sequence length, as expected: the dense grid is O(seqlen^2) while useful work
+is only O(seqlen x segment). **The optimization is most valuable exactly where the customer needs
+it.**
+
+`test_attention_cte_seqpack_prune.py`: **36 passed, 0 xfailed**, including device
+output-neutrality across LNC=1 and LNC=2 and five multi-section configs.
 
 ## Why MM2 is deliberately NOT pruned
 
@@ -52,12 +64,42 @@ explicit PSUM-bank initialization or forced-first-write story. Do not attempt it
 Note: `_FLOAT32_MIN` is **not** a usable fill value here -- it overflowed to `2.5e38` in the
 output once the running-max bias was applied.
 
-## Known gap: multi-section (seqlen > 8192)
+## Multi-section support (how it was fixed)
 
-Tracked by `test_seqpack_prune_multisection_output_neutral` as a **strict xfail**, so it will fail
-loudly when fixed. At 16384 = 16 x 1024 the prune produces `nan`; the cross-section running-max /
-running-sum accumulation is not yet handled. This is the highest-value remaining work -- measured
-2.85x wall-clock / 3.53x MACs at that shape.
+Two distinct defects, both specific to sequence packing:
+
+**1. Accumulators were initialized on section 0 instead of the group's first LIVE section.**
+
+The flash accumulators (`mm1_running_max`, `exp_running_sum`, `flash_attn_correction_factor`) are
+initialized on `sp.section_idx == 0` and updated thereafter. That is correct for causal and dense
+masking because their liveness is **monotone** in section index -- if a section is live for a
+group, every earlier section is too, so the first live section is always section 0.
+
+**Sequence-packing liveness is not monotone.** A Q group belongs to one segment `[a, b)` and is
+live only in sections overlapping `[a, b)` -- a contiguous *middle band*, not a prefix. A group
+whose segment begins past the first section is skipped in section 0, so its initializer never
+ran and the update path read uninitialized accumulators. Symptom: `nan`.
+
+Fixed by `_is_first_live_section()`, used in place of `sp.section_idx == 0` at all five
+accumulator-init / write-vs-accumulate branches. It falls back to `sp.section_idx == 0` whenever
+no compile-time layout is available, so existing behavior is untouched.
+
+**2. The empty-span guard returned the wrong answer for "is there a NEXT section".**
+
+`_has_any_compute_bounds_section` originally returned `True` for a section past the end of active
+K. That looks like the safe, conservative choice for "should I skip this tile?" -- and it is. But
+callers also ask the same question about the *next* section to compute
+`is_last_section_with_compute`, where `True` means *"more work is coming"*. For a group whose only
+live section was the last one, that suppressed the final `1/sum` normalization and silently
+emitted **unnormalized** output.
+
+Symptom: finite values, no `nan`, cos 0.718, and *exactly* the 64 of 128 Q groups whose only live
+section was section 1. Fixed by returning `False` for an empty span.
+
+**Diagnostic worth reusing**: a per-Q-group error map identified both defects immediately. The
+first gave `nan`; the second gave a clean partition where every wrong group shared the same
+liveness pattern (`livesec=[1]`). A scalar cosine would have shown "0.718, still broken" and
+nothing more.
 
 ## Validation lesson
 
