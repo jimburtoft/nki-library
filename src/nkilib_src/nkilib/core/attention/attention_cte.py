@@ -213,6 +213,7 @@ def attention_cte(
     cp_strided_q_slicing: bool = False,
     bound_min: Optional[nl.NkiTensor] = None,
     bound_max: Optional[nl.NkiTensor] = None,
+    segment_cu_seqlens: Optional[tuple] = None,
     cp_striped_input: bool = False,
     skip_output_normalization: bool = False,
     position_bias: Optional[nl.NkiTensor] = None,
@@ -430,6 +431,7 @@ def attention_cte(
         cp_strided_q_slicing=cp_strided_q_slicing,
         bound_min=bound_min,
         bound_max=bound_max,
+        segment_cu_seqlens=segment_cu_seqlens,
         cp_striped_input=cp_striped_input,
         skip_output_normalization=skip_output_normalization,
         position_bias=position_bias,
@@ -460,6 +462,7 @@ def _attention_cte(
     cp_strided_q_slicing: bool = False,
     bound_min: Optional[nl.NkiTensor] = None,
     bound_max: Optional[nl.NkiTensor] = None,
+    segment_cu_seqlens: Optional[tuple] = None,
     cp_striped_input: bool = False,
     skip_output_normalization: bool = False,
     k_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
@@ -569,6 +572,24 @@ def _attention_cte(
     # Sequence packing is active when per-query KV bounds are provided
     is_sequence_packed = bound_min is not None
 
+    # Compile-time segment layout for sequence packing. Trace-time metadata that
+    # mirrors what bound_min/bound_max encode on the device; enables tile pruning.
+    segment_spans = None
+    if segment_cu_seqlens is not None:
+        kernel_assert(
+            is_sequence_packed,
+            "segment_cu_seqlens requires bound_min/bound_max (it describes the same layout)",
+        )
+        _cu = [int(x) for x in segment_cu_seqlens]
+        kernel_assert(len(_cu) >= 2, "segment_cu_seqlens must have at least 2 entries")
+        kernel_assert(_cu[0] == 0, "segment_cu_seqlens must start at 0")
+        for _i in range(len(_cu) - 1):
+            kernel_assert(
+                _cu[_i + 1] > _cu[_i],
+                "segment_cu_seqlens must be strictly increasing",
+            )
+        segment_spans = [(_cu[_i], _cu[_i + 1]) for _i in range(len(_cu) - 1)]
+
     # Validate kv_used_len: dynamic active-KV upper bound. Restricted to the
     # non-APC, non-SWA, non-CP, non-sequence-packed, non-causal path. Shape
     # must be (1,) for HBM or (1, 1) for SBUF (same convention as prior_used_len).
@@ -641,6 +662,14 @@ def _attention_cte(
             f"bound_max shape must be (batch, seqlen_q, 1)=({batch_size}, {seqlen_q}, 1), got {bound_max.shape}",
         )
         kernel_assert(not is_prefix_caching, "is_sequence_packed is not supported with prefix caching")
+        # The compile-time descriptor, when supplied, must cover the whole query sequence.
+        # A short descriptor would let us prune tiles the device-side bounds still treat as
+        # live. Checked here because seqlen_q is only known after shape resolution.
+        if segment_spans is not None:
+            kernel_assert(
+                segment_spans[-1][1] == seqlen_q,
+                f"segment_cu_seqlens must end at seqlen_q, got {segment_spans[-1][1]} != {seqlen_q}",
+            )
         if global_cp_deg is not None and global_cp_deg > 1:
             kernel_assert(
                 cp_striped_input,
@@ -838,6 +867,7 @@ def _attention_cte(
         softmax_dtype=softmax_dtype,
         mm_out_dtype=mm_out_dtype,
         is_sequence_packed=is_sequence_packed,
+        segment_spans=segment_spans,
         has_kv_used_len=has_kv_used_len,
         use_position_bias=position_bias is not None,
         bias_layout=bias_layout,
@@ -908,6 +938,7 @@ def _attention_cte(
             cp_offset=cp_offset,
             bound_min=bound_min,
             bound_max=bound_max,
+            segment_cu_seqlens=segment_cu_seqlens,
             k_cache_sbuf=k_cache_sbuf,
             v_cache_sbuf=v_cache_sbuf,
             k_prior_sbuf=k_prior_sbuf,
@@ -965,6 +996,7 @@ def _attention_cte(
                 cp_offset=cp_offset,
                 bound_min=bound_min,
                 bound_max=bound_max,
+                segment_cu_seqlens=segment_cu_seqlens,
                 k_prior_sbuf=k_prior_sbuf,
                 v_prior_sbuf=v_prior_sbuf,
                 kv_used_len=kv_used_len,
@@ -990,6 +1022,7 @@ def _attention_cte(
                     cp_offset=cp_offset,
                     bound_min=bound_min,
                     bound_max=bound_max,
+                    segment_cu_seqlens=segment_cu_seqlens,
                     k_prior_sbuf=k_prior_sbuf,
                     v_prior_sbuf=v_prior_sbuf,
                     kv_used_len=kv_used_len,
@@ -1045,6 +1078,9 @@ class AttnConfig(nl.NKIObject):
 
     # sequence packing
     is_sequence_packed: bool = None
+    # Trace-time segment spans [(start, end_exclusive), ...] from segment_cu_seqlens.
+    # None => no compile-time pruning (compute every tile, mask to -inf as before).
+    segment_spans: Any = None
 
     # Dynamic active-KV masking: when True, query positions attend only to
     # active-K positions [0, kv_used_len). Restricted to causal_mask=False
@@ -1093,6 +1129,7 @@ def _attention_cte_impl(
     cp_offset: Any = None,
     bound_min: Any = None,
     bound_max: Any = None,
+    segment_cu_seqlens: Optional[tuple] = None,
     k_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
     v_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
     k_prior_sbuf: Optional[List[nl.NkiTensor]] = None,
@@ -1720,6 +1757,7 @@ def _setup_range_select_bounds(
     prior_used_len: Any,
     bound_min: Any,
     bound_max: Any,
+    segment_cu_seqlens: Optional[tuple] = None,
     batch_id: int = 0,
     kv_used_len: Any = None,
 ) -> tuple:
@@ -3015,6 +3053,13 @@ def _exp_impl(
                 # Use tile top-right corner so adjust k; also adjust q for sliding window
                 exp_sel_mask = exp_sel_mask and _has_any_compute_swa(grp_i, k_start_pos, atp.exp_inst_elems, ac)
 
+            # Sequence-packing compute skipping (exp pass): drop tiles whose every
+            # (q, k) pair is out of bounds. No-op unless segment_spans was supplied.
+            if ac.is_sequence_packed and not is_prior_tile:
+                exp_sel_mask = exp_sel_mask and _has_any_compute_bounds(
+                    grp_i, k_start_pos, atp.exp_inst_elems, ac
+                )
+
             if exp_sel_mask and seqlen_k > k_start_pos:
                 # Step 1: Compute exponential
                 nisa.activation_reduce(
@@ -3565,6 +3610,13 @@ def _qk_and_max_large_tile_impl(
         else:
             matmul_selection = True
 
+        # Sequence-packing compute skipping (MM1): drop tiles whose every (q, k) pair
+        # is out of bounds. No-op unless segment_spans was supplied.
+        if ac.is_sequence_packed and not is_prior_tile:
+            matmul_selection = matmul_selection and _has_any_compute_bounds(
+                qkmax_grp, k_start_pos, _K_TILE_SZ, ac
+            )
+
         if q_seqlen_offset >= ac.seqlen_q or k_start_pos >= seqlen_k:  # make sure we don't extend bound
             matmul_selection = False
 
@@ -3867,6 +3919,13 @@ def _pv_large_tile_impl(
                 if ac.use_swa and atp.is_causal and not is_prior_tile:
                     mm2_sel_mask = mm2_sel_mask and _has_any_compute_swa(pv_grp, k_start_pos, _V_TILE_SZ, ac)
 
+                # Bound-dead tile has exp(-inf)=0 across its P block -> MM2 adds a known
+                # zero. Skip it. The existing mm2_psum_set guard covers an all-skipped d-tile.
+                if ac.is_sequence_packed and not is_prior_tile:
+                    mm2_sel_mask = mm2_sel_mask and _has_any_compute_bounds(
+                        pv_grp, k_start_pos, _V_TILE_SZ, ac
+                    )
+
                 if mm2_sel_mask and v_tile_idx < atp.num_v_tiles_per_section and num_p > 0 and num_f > 0:
                     mm2_psum_set = True
 
@@ -3915,6 +3974,43 @@ def _pv_large_tile_impl(
                         nl.add,
                     )
 
+
+
+def _has_any_compute_bounds(q_grp: int, k_start_pos: int, k_tile_size: int, ac: AttnConfig):
+    """Sequence-packing compute skipping (compile-time).
+
+    Return True if the given Q group has any in-bounds key in the tile starting at
+    ``k_start_pos``. Returns False only when EVERY (q, k) pair in the tile lies outside
+    the packed-sequence bounds -- i.e. the tile's entire QK^T result is destined for
+    -inf and its MM1/MM2 matmuls plus the exp/transpose traffic are pure waste.
+
+    Bounds analogue of ``_has_any_compute_causal`` / ``_has_any_compute_swa``, evaluated
+    with the same pure-Python integer arithmetic on loop indices, so a False result
+    removes instructions from the emitted graph rather than merely masking them.
+
+    Conservative by construction: returns True (no pruning, exact previous behavior)
+    whenever no compile-time layout was supplied or the addressing mode remaps
+    query/key coordinates.
+
+    Each query attends to one contiguous key span [start, end), so a tile is live iff
+    some segment overlapping this Q group's rows also overlaps the tile's key range.
+    """
+    if ac.segment_spans is None:
+        return True
+    # Round-robin KV: k_start_pos is an SBUF position, not a global one.
+    if ac.kvp_group_size > 0:
+        return True
+    # Strided / striped CP remap query positions; segment spans are global.
+    if ac.cp_strided_q_slicing or ac.cp_striped_input:
+        return True
+    q_start = q_grp * _Q_GRP_SZ
+    q_end = min(q_start + _Q_GRP_SZ, ac.seqlen_q)
+    k_end = k_start_pos + k_tile_size
+    for seg_start, seg_end in ac.segment_spans:
+        if seg_start < q_end and q_start < seg_end:
+            if seg_start < k_end and k_start_pos < seg_end:
+                return True
+    return False
 
 def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_grps: int = 1):
     """
