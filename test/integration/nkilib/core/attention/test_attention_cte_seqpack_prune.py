@@ -198,13 +198,25 @@ SEQPACK_PRUNE_CASES = [
     ("bs2_s2048_4x512_nocausal",   2, 2048, 128, 512,  False),
 ]
 
-# MULTI-SECTION configurations, tracked separately because they are a KNOWN GAP.
-# seqlen > 8192 splits into more than one flash section, which brings the cross-section
-# running-max / running-sum accumulation into play. The MM1+exp prune with identity fill
-# does not yet handle it and produces nan. Kept as xfail so the gap stays visible and
-# flips to a failure the moment someone fixes it without updating this list.
+# MULTI-SECTION configurations (seqlen > 8192, so more than one flash section).
+#
+# These are the lengths that actually matter for the customer: their ViT targets 128K via
+# context parallelism, so the relevant shapes are the PER-RANK lengths. They are also where the
+# payoff is largest -- waste grows with sequence length, since the dense grid is O(seqlen^2)
+# while useful work is only O(seqlen * segment).
+#
+# Multi-section requires the flash cross-section accumulators (mm1_running_max, exp_running_sum,
+# flash_attn_correction_factor) to be initialized on a group's FIRST LIVE section rather than on
+# section 0. Sequence-packing liveness is a contiguous middle band, not a prefix, so a group
+# whose segment starts past the first section is skipped in section 0 -- see
+# _is_first_live_section in attention_cte.py.
 SEQPACK_PRUNE_MULTISECTION_CASES = [
-    ("s16384_16x1024_nocausal", 1, 16384, 128, 1024, False),
+    # (id, bs, seqlen, d, segment_spec, causal)
+    ("s16384_16x1024_nocausal", 1, 16384, 128, 1024, False),   # CP=8 rank of 128K
+    ("s16384_16x1024_causal",   1, 16384, 128, 1024, True),
+    ("s16384_32x512_nocausal",  1, 16384, 128, 512,  False),
+    ("s24576_24x1024_nocausal", 1, 24576, 128, 1024, False),   # 3 sections (odd count)
+    ("s32768_32x1024_nocausal", 1, 32768, 128, 1024, False),   # CP=4 rank of 128K
 ]
 
 
@@ -421,13 +433,6 @@ def test_seqpack_prune_predicate_is_sound(seqlen, seg):
     )
 
 
-@pytest.mark.xfail(
-    reason="KNOWN GAP: multi-section (seqlen > 8192) flash cross-section accumulation is not "
-           "yet handled by sequence-packing tile pruning; produces nan. Wall-clock and MAC "
-           "savings are large here (2.85x / 3.53x measured), so this is the highest-value "
-           "remaining work.",
-    strict=True,
-)
 @pytest.mark.parametrize(
     "bs, seqlen, d, seg_spec, causal",
     [c[1:] for c in SEQPACK_PRUNE_MULTISECTION_CASES],
@@ -436,8 +441,15 @@ def test_seqpack_prune_predicate_is_sound(seqlen, seg):
 def test_seqpack_prune_multisection_output_neutral(bs, seqlen, d, seg_spec, causal):
     """Same contract as the single-section test, for seqlen > 8192.
 
-    Separated so the known multi-section gap does not mask a regression in the
-    single-section path, and so it fails loudly once fixed (strict xfail).
+    Kept separate from the single-section matrix because the failure modes are different: these
+    exercise the cross-section flash accumulators, which single-section configs never touch.
+    Measured MAC reduction and wall-clock at these lengths (LNC=2, d=128, non-causal):
+
+        16384 (2 sections)  3.53x MACs -> 2.93x wall-clock
+        32768 (4 sections)  7.07x MACs -> 5.95x wall-clock
+
+    i.e. this is where the optimization actually pays, so a regression here matters more than
+    one at 4096.
     """
     cu = _cu_from_spec(seqlen, seg_spec)
     q, k, v = _make_inputs(bs, seqlen, d)

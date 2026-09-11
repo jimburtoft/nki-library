@@ -2975,7 +2975,7 @@ def _update_max_impl(
 
     # Step 1: Compute section max
     # If we have sink, need to include it in final max compute
-    if (sink is not None) and (sp.section_idx == 0):
+    if (sink is not None) and _is_first_live_section(grp_i, ac, atp, sp):
         nisa.tensor_copy(bufs.mm1_partial_max[grp_i][:, atp.num_k_tiles_per_section], bufs.sink_sb)
 
     nisa.tensor_reduce(
@@ -2988,10 +2988,10 @@ def _update_max_impl(
 
     # Step 2: compute and store running max, and flash attention correction factor
     if atp.num_sections != 1:
-        if sp.section_idx == 0:
+        if _is_first_live_section(grp_i, ac, atp, sp):
             nisa.tensor_copy(bufs.mm1_running_max[:, grp_i], bufs.mm1_section_max[grp_i])
             nisa.memset(bufs.flash_attn_correction_factor[grp_i][...], value=0.0)
-        if sp.section_idx > 0:
+        else:
             nisa.activation(
                 bufs.prev_mm1_running_max[grp_i][...],
                 nl.copy,
@@ -3168,7 +3168,7 @@ def _exp_impl(
                     )
 
     # If there is sink, subtract max from it, then take its exp, then append it to sums
-    if (sink is not None) and (sp.section_idx == 0):
+    if (sink is not None) and _is_first_live_section(grp_i, ac, atp, sp):
         frs_sink_idx = bufs.exp_partial_sum[grp_i].shape[-1] - 1
         nisa.activation(
             bufs.exp_partial_sum[grp_i][:, frs_sink_idx],
@@ -3287,9 +3287,9 @@ def _write_back_impl(
     q_seqlen_offset = grp_i * atp.sb_p
     nisa.tensor_reduce(bufs.exp_section_sum[grp_i][...], nl.add, bufs.exp_partial_sum[grp_i], axis=1)
     if atp.num_sections != 1:
-        if sp.section_idx == 0:
+        if _is_first_live_section(grp_i, ac, atp, sp):
             nisa.tensor_copy(bufs.exp_running_sum[:, grp_i], bufs.exp_section_sum[grp_i])
-        if sp.section_idx > 0:
+        else:
             nisa.tensor_copy(
                 bufs.prev_exp_running_sum[grp_i][...],
                 bufs.exp_running_sum[:, grp_i],
@@ -3334,7 +3334,7 @@ def _write_back_impl(
     num_d_tiles_iter = atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim
     d_tile_size = atp.d_tile_size_par_dim if ac.tp_out else atp.d_tile_size_free_dim
     if atp.num_sections != 1:
-        if sp.section_idx == 0:
+        if _is_first_live_section(grp_i, ac, atp, sp):
             if is_last_section_with_compute:
                 if ac.skip_output_normalization:
                     _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
@@ -3345,7 +3345,7 @@ def _write_back_impl(
             else:
                 _write_back_o_impl(bufs.mm2_sb[grp_i], grp_i, ac, atp, o, batch_id, num_p, num_f)
 
-        if sp.section_idx > 0:
+        else:
             # Load previous output, scale by flash_attn_correction_factor and accumulate
             for d_tile in range(num_d_tiles_iter):
                 d = min(d_tile_size, ac.d - d_tile * d_tile_size)
@@ -4075,6 +4075,42 @@ def _has_any_compute_bounds(q_grp: int, k_start_pos: int, k_tile_size: int, ac: 
                 return True
     return False
 
+def _is_first_live_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
+    """Is this the FIRST section in which ``q_grp`` has any work?
+
+    The flash-attention accumulators (``mm1_running_max``, ``exp_running_sum``,
+    ``flash_attn_correction_factor``) must be INITIALIZED on a group's first live section and
+    UPDATED on every subsequent one. The kernel normally spells that as ``sp.section_idx == 0``,
+    which is correct for causal and dense masking because their liveness is **monotone** in
+    section index: if section s is live for a group, so is every earlier section, hence the
+    first live section is always section 0.
+
+    **Sequence packing breaks that assumption.** A Q group belongs to one packed segment
+    ``[a, b)`` and is live only in the sections that overlap ``[a, b)`` -- a contiguous *middle
+    band*, not a prefix. A group whose segment starts past the first section is skipped in
+    section 0, so an ``sp.section_idx == 0`` initializer never runs for it, and the
+    ``section_idx > 0`` update path then reads uninitialized accumulators (observed as ``nan``).
+
+    Returns True when ``sp`` is the earliest live section for ``q_grp``, so callers can use it
+    in place of ``sp.section_idx == 0``. Falls back to ``sp.section_idx == 0`` whenever no
+    compile-time segment layout is available, preserving existing behavior exactly.
+
+    :param q_grp: q group index
+    :param ac: AttnConfig
+    :param atp: AttnTileParams
+    :param sp: SectionParams for the current section
+    """
+    if ac.segment_spans is None or not ac.is_sequence_packed:
+        return sp.section_idx == 0
+    if ac.kvp_group_size > 0 or ac.cp_strided_q_slicing or ac.cp_striped_input or ac.is_prefix_caching:
+        return sp.section_idx == 0
+    # Scan earlier sections; if any was live for this group, this is not the first.
+    for earlier in range(sp.section_idx):
+        if _has_any_compute_bounds_section(q_grp, ac, atp, earlier * atp.section_len):
+            return False
+    return True
+
+
 def _has_any_compute_bounds_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams,
                                     section_offset_active: int, num_grps: int = 1):
     """Whole-(Q group, section) sequence-packing skip.
@@ -4113,7 +4149,16 @@ def _has_any_compute_bounds_section(q_grp: int, ac: AttnConfig, atp: AttnTilePar
     k_start = section_offset_active
     k_end = min(k_start + atp.section_len, atp.seqlen_k_active_updated)
     if k_end <= k_start:
-        return True
+        # Empty span: this section lies entirely past the end of active K, so there is no
+        # work here. Return False, NOT True.
+        #
+        # Returning True would look like the "safe, conservative" choice -- and it is, for the
+        # question "should I skip this tile?". But callers also ask this about the NEXT section
+        # to decide `is_last_section_with_compute`, and there True means "more work is coming",
+        # which suppresses the final 1/sum normalization and silently emits unnormalized output.
+        # (Observed as cos 0.718 with finite values for exactly those Q groups whose only live
+        # section was the last one.)
+        return False
     q_start = q_grp * _Q_GRP_SZ
     q_end = min(q_start + _Q_GRP_SZ * num_grps, ac.seqlen_q)
     for seg_start, seg_end in ac.segment_spans:
