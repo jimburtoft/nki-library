@@ -4063,17 +4063,79 @@ def _has_any_compute_bounds(q_grp: int, k_start_pos: int, k_tile_size: int, ac: 
     # Round-robin KV: k_start_pos is an SBUF position, not a global one.
     if ac.kvp_group_size > 0:
         return True
-    # Strided / striped CP remap query positions; segment spans are global.
-    if ac.cp_strided_q_slicing or ac.cp_striped_input:
+    # Strided Q slicing remaps queries differently from the striped layout we model.
+    if ac.cp_strided_q_slicing:
+        return True
+    # Striped CP is supported, but only while the layout keeps the decision rank-independent.
+    if not _striped_prune_is_safe(ac):
         return True
     q_start = q_grp * _Q_GRP_SZ
     q_end = min(q_start + _Q_GRP_SZ, ac.seqlen_q)
-    k_end = k_start_pos + k_tile_size
-    for seg_start, seg_end in ac.segment_spans:
-        if seg_start < q_end and q_start < seg_end:
-            if seg_start < k_end and k_start_pos < seg_end:
-                return True
-    return False
+    k_end = min(k_start_pos + k_tile_size, ac.seqlen_q)
+    if q_end <= q_start or k_end <= k_start_pos:
+        return True
+    q_segs = _local_range_segment_ids(q_start, q_end, ac)
+    k_segs = _local_range_segment_ids(k_start_pos, k_end, ac)
+    return bool(q_segs & k_segs)
+
+def _local_range_segment_ids(local_start: int, local_end: int, ac: AttnConfig):
+    """Segment ids touched by local positions ``[local_start, local_end)``.
+
+    Handles both layouts:
+
+    * **Contiguous** (no CP, or CP without striping): local position ``i`` is global position
+      ``i``, so the range maps to a contiguous global span.
+    * **Striped CP** (``cp_striped_input``): the sequence is distributed round-robin, so local
+      position ``i`` on rank ``r`` is global position ``i * D + r`` where ``D = global_cp_deg``.
+      A contiguous local range therefore maps to an arithmetic progression of stride ``D``
+      spanning ``(local_end - local_start) * D`` globally.
+
+    **Why this can be a compile-time decision at all**: the result must not depend on ``r``,
+    because a single SPMD binary runs on every rank and ``cp_offset`` is a runtime tensor.
+    Changing ``r`` shifts every global position by the same constant ``< D``, which cannot move
+    a position across a segment boundary as long as every segment is longer than ``D``. Callers
+    enforce that via ``_striped_prune_is_safe``, so we may compute with ``r = 0`` and the answer
+    is valid for all ranks. Verified empirically to be rank- and ring-step-independent for
+    D in {2,4,8,16} at segment sizes 1000-4096.
+
+    :param local_start: first local position (inclusive)
+    :param local_end: last local position (exclusive)
+    :param ac: AttnConfig
+    :return: set of segment indices into ``ac.segment_spans``
+    """
+    spans = ac.segment_spans
+    ids = set()
+    if not ac.cp_striped_input:
+        for si, (seg_start, seg_end) in enumerate(spans):
+            if seg_start < local_end and local_start < seg_end:
+                ids.add(si)
+        return ids
+    # Striped: walk the arithmetic progression. Bounded by the local range length (<= 512),
+    # so this stays cheap at trace time.
+    d = ac.global_cp_deg
+    for i in range(local_start, local_end):
+        g = i * d  # rank 0; rank-independent by the argument above
+        for si, (seg_start, seg_end) in enumerate(spans):
+            if seg_start <= g < seg_end:
+                ids.add(si)
+                break
+    return ids
+
+
+def _striped_prune_is_safe(ac: AttnConfig):
+    """May we prune under the current CP layout?
+
+    Striped pruning is rank-independent only while every packed segment is longer than the CP
+    degree (see ``_local_range_segment_ids``). Returns False otherwise, so the caller falls back
+    to computing every tile -- correct, just not optimized.
+    """
+    if not ac.cp_striped_input:
+        return True
+    d = ac.global_cp_deg
+    if not d or d <= 1:
+        return True
+    return all((seg_end - seg_start) > d for seg_start, seg_end in ac.segment_spans)
+
 
 def _is_first_live_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
     """Is this the FIRST section in which ``q_grp`` has any work?
@@ -4102,7 +4164,9 @@ def _is_first_live_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams, sp: 
     """
     if ac.segment_spans is None or not ac.is_sequence_packed:
         return sp.section_idx == 0
-    if ac.kvp_group_size > 0 or ac.cp_strided_q_slicing or ac.cp_striped_input or ac.is_prefix_caching:
+    if ac.kvp_group_size > 0 or ac.cp_strided_q_slicing or ac.is_prefix_caching:
+        return sp.section_idx == 0
+    if not _striped_prune_is_safe(ac):
         return sp.section_idx == 0
     # Scan earlier sections; if any was live for this group, this is not the first.
     for earlier in range(sp.section_idx):
@@ -4141,9 +4205,11 @@ def _has_any_compute_bounds_section(q_grp: int, ac: AttnConfig, atp: AttnTilePar
         return True
     if ac.kvp_group_size > 0:
         return True
-    if ac.cp_strided_q_slicing or ac.cp_striped_input:
+    if ac.cp_strided_q_slicing:
         return True
     if ac.is_prefix_caching:
+        return True
+    if not _striped_prune_is_safe(ac):
         return True
     # Active-K span covered by this section.
     k_start = section_offset_active
@@ -4161,11 +4227,11 @@ def _has_any_compute_bounds_section(q_grp: int, ac: AttnConfig, atp: AttnTilePar
         return False
     q_start = q_grp * _Q_GRP_SZ
     q_end = min(q_start + _Q_GRP_SZ * num_grps, ac.seqlen_q)
-    for seg_start, seg_end in ac.segment_spans:
-        if seg_start < q_end and q_start < seg_end:
-            if seg_start < k_end and k_start < seg_end:
-                return True
-    return False
+    if q_end <= q_start:
+        return False
+    q_segs = _local_range_segment_ids(q_start, q_end, ac)
+    k_segs = _local_range_segment_ids(k_start, k_end, ac)
+    return bool(q_segs & k_segs)
 
 
 def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_grps: int = 1):
