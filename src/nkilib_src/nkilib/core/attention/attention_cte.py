@@ -155,6 +155,7 @@ from ..utils.stream_shuffle_broadcast import stream_shuffle_broadcast
 logger = get_logger("attention_cte")
 
 
+_SEQPACK_SKIP_FILL = -30000.0  # exp() -> 0, no overflow when biased by running max
 _FLOAT32_MIN = -3.4028235e38  # used for initialization and masking
 
 """
@@ -2892,6 +2893,10 @@ def _load_q_impl(
             if (atp.is_causal and not sp.section_contains_prefix)
             else True
         )
+        if ac.is_sequence_packed and not sp.section_contains_prefix:
+            has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+                grp_i, ac, atp, sp.section_offset_active, atp.num_q_grps_per_load
+            )
         if has_any_compute_pred:
             q_seqlen_offset = grp_i * _Q_GRP_SZ
             _load_q_tile(
@@ -2936,6 +2941,10 @@ def _qk_and_max_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if has_any_compute_pred:
         nisa.memset(bufs.mm1_partial_max[grp_i], value=_FLOAT32_MIN)
 
@@ -2957,6 +2966,10 @@ def _update_max_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if not has_any_compute_pred:
         return
 
@@ -3017,6 +3030,10 @@ def _exp_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if not has_any_compute_pred:
         return
 
@@ -3053,12 +3070,24 @@ def _exp_impl(
                 # Use tile top-right corner so adjust k; also adjust q for sliding window
                 exp_sel_mask = exp_sel_mask and _has_any_compute_swa(grp_i, k_start_pos, atp.exp_inst_elems, ac)
 
-            # Sequence-packing compute skipping (exp pass): drop tiles whose every
-            # (q, k) pair is out of bounds. No-op unless segment_spans was supplied.
+
             if ac.is_sequence_packed and not is_prior_tile:
-                exp_sel_mask = exp_sel_mask and _has_any_compute_bounds(
-                    grp_i, k_start_pos, atp.exp_inst_elems, ac
-                )
+                if not _has_any_compute_bounds(grp_i, k_start_pos, atp.exp_inst_elems, ac):
+                    if exp_sel_mask and seqlen_k > k_start_pos and num_f > 0 and num_p > 0:
+                        # exp_sb and exp_tp_sb are MODULO-allocated over q groups; zero the
+                        # slices this tile owns so MM2 consumes zeros rather than another
+                        # group's probabilities. exp_partial_sum is memset per group.
+                        nisa.memset(
+                            bufs.exp_sb[grp_i][large_tile_idx][
+                                :num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)
+                            ],
+                            value=0.0,
+                        )
+                        nisa.memset(
+                            bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx][...],
+                            value=0.0,
+                        )
+                    exp_sel_mask = False
 
             if exp_sel_mask and seqlen_k > k_start_pos:
                 # Step 1: Compute exponential
@@ -3162,6 +3191,10 @@ def _pv_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     if has_any_compute_pred:
         for _d_tile in range(atp.num_d_tiles if ac.tp_out else atp.num_d_tiles_free_dim):
             nisa.memset(bufs.mm2_sb[grp_i][_d_tile][...], value=0.0)
@@ -3191,6 +3224,15 @@ def _fused_qkmax_and_pv_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        # Both halves of the fused stage must use the SAME skip decision as their
+        # non-fused counterparts, or one pass would write buffers the other skips.
+        has_any_compute_pred_pv = has_any_compute_pred_pv and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
+        has_any_compute_pred_qkmax = has_any_compute_pred_qkmax and _has_any_compute_bounds_section(
+            qkmax_grp, ac, atp, sp.section_offset_active
+        )
     nisa.memset(bufs.mm1_partial_max[qkmax_grp][...], value=_FLOAT32_MIN)
 
     for large_tile_idx in range(atp.num_large_tiles_per_section):
@@ -3216,6 +3258,10 @@ def _write_back_impl(
         if (atp.is_causal and not sp.section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.section_contains_prefix:
+        has_any_compute_pred = has_any_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.section_offset_active
+        )
     # if we have compute for this section but not the next section,
     # then this is the last section to have compute, and we need to
     # execute the final section logic to write final results
@@ -3224,6 +3270,14 @@ def _write_back_impl(
         if (atp.is_causal and not sp.next_section_contains_prefix)
         else True
     )
+    if ac.is_sequence_packed and not sp.next_section_contains_prefix:
+        # Must mirror the gate applied to has_any_compute_pred, evaluated for the NEXT
+        # section. Otherwise "last section with compute" is computed against a different
+        # liveness definition than the one that actually gates execution, and a group's
+        # final normalize-and-write-to-HBM step can be skipped entirely (or run twice).
+        next_has_compute_pred = next_has_compute_pred and _has_any_compute_bounds_section(
+            grp_i, ac, atp, sp.next_section_offset_active
+        )
     is_last_section_with_compute = has_any_compute_pred and (not next_has_compute_pred)
 
     if not has_any_compute_pred:
@@ -3610,15 +3664,31 @@ def _qk_and_max_large_tile_impl(
         else:
             matmul_selection = True
 
-        # Sequence-packing compute skipping (MM1): drop tiles whose every (q, k) pair
-        # is out of bounds. No-op unless segment_spans was supplied.
+
+        # Sequence-packing compute skipping (MM1). Pruning here is only safe because the
+        # branch below writes the identity value into mm1_masked for the skipped slice:
+        # mm1_masked is MODULO-allocated over q groups (num_free_tiles=[2, n_lt]), so
+        # leaving it unwritten exposes a previous q group's finite scores to the exp pass.
+        bounds_skip = False
         if ac.is_sequence_packed and not is_prior_tile:
-            matmul_selection = matmul_selection and _has_any_compute_bounds(
-                qkmax_grp, k_start_pos, _K_TILE_SZ, ac
-            )
+            bounds_skip = not _has_any_compute_bounds(qkmax_grp, k_start_pos, _K_TILE_SZ, ac)
 
         if q_seqlen_offset >= ac.seqlen_q or k_start_pos >= seqlen_k:  # make sure we don't extend bound
             matmul_selection = False
+            bounds_skip = False
+
+        if bounds_skip:
+            matmul_selection = False
+            _nf = min(seqlen_k - k_start_pos, _K_TILE_SZ)
+            _np_ = min(ac.seqlen_q - q_seqlen_offset, _Q_GRP_SZ)
+            if _nf > 0 and _np_ > 0:
+                # exp() of this is 0 after the running-max bias is applied, so the tile
+                # contributes nothing to the softmax sum or to PV. mm1_partial_max is
+                # already memset to _FLOAT32_MIN per group, so the max is unaffected.
+                nisa.memset(
+                    mm1_masked_tile[:_np_, nl.ds(k_tile_idx * _K_TILE_SZ, _nf)],
+                    value=_SEQPACK_SKIP_FILL,
+                )
 
         if matmul_selection and k_tile_idx_in_section < atp.num_k_tiles_per_section:
             num_f = min(seqlen_k - k_start_pos, _K_TILE_SZ)
@@ -3919,13 +3989,6 @@ def _pv_large_tile_impl(
                 if ac.use_swa and atp.is_causal and not is_prior_tile:
                     mm2_sel_mask = mm2_sel_mask and _has_any_compute_swa(pv_grp, k_start_pos, _V_TILE_SZ, ac)
 
-                # Bound-dead tile has exp(-inf)=0 across its P block -> MM2 adds a known
-                # zero. Skip it. The existing mm2_psum_set guard covers an all-skipped d-tile.
-                if ac.is_sequence_packed and not is_prior_tile:
-                    mm2_sel_mask = mm2_sel_mask and _has_any_compute_bounds(
-                        pv_grp, k_start_pos, _V_TILE_SZ, ac
-                    )
-
                 if mm2_sel_mask and v_tile_idx < atp.num_v_tiles_per_section and num_p > 0 and num_f > 0:
                     mm2_psum_set = True
 
@@ -4011,6 +4074,54 @@ def _has_any_compute_bounds(q_grp: int, k_start_pos: int, k_tile_size: int, ac: 
             if seg_start < k_end and k_start_pos < seg_end:
                 return True
     return False
+
+def _has_any_compute_bounds_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams,
+                                    section_offset_active: int, num_grps: int = 1):
+    """Whole-(Q group, section) sequence-packing skip.
+
+    Returns False only when the ENTIRE active-K span of this flash section is out of bounds
+    for every query row in the group -- i.e. the group has no work at all in this section.
+
+    Why this granularity and not per-tile: the kernel's SBUF/PSUM working buffers are
+    ring/modulo-allocated for the 2-deep software pipeline (``mm1_masked`` num_free_tiles
+    ``[2, ...]``, ``mm1_partial_max`` ``[2]``, ``exp_sb`` ``[1, ...]``, and ``mm2_psum``
+    PSUM banks addressed by ``large_tile_idx % (banks - 4)`` and accumulated into by
+    ``nc_matmul``). Skipping an individual tile leaves a *previous* Q group's finite scores
+    at that offset instead of zeros/-inf, and those leak into the softmax max, the softmax
+    denominator, and the PV accumulation. Skipping at whole-(group, section) granularity
+    instead composes with the existing ``has_any_compute_pred`` gates, which already skip
+    every pass consistently for a group and therefore never leave a partially-written
+    buffer behind.
+
+    :param q_grp: q group index
+    :param ac: AttnConfig
+    :param atp: AttnTileParams
+    :param section_offset_active: active-K offset of the section being asked about (pass
+        ``sp.section_offset_active`` for the current section or ``sp.next_section_offset_active``
+        for the next one)
+    :param num_grps: number of consecutive q groups covered (for the fused Q-load path)
+    """
+    if ac.segment_spans is None:
+        return True
+    if ac.kvp_group_size > 0:
+        return True
+    if ac.cp_strided_q_slicing or ac.cp_striped_input:
+        return True
+    if ac.is_prefix_caching:
+        return True
+    # Active-K span covered by this section.
+    k_start = section_offset_active
+    k_end = min(k_start + atp.section_len, atp.seqlen_k_active_updated)
+    if k_end <= k_start:
+        return True
+    q_start = q_grp * _Q_GRP_SZ
+    q_end = min(q_start + _Q_GRP_SZ * num_grps, ac.seqlen_q)
+    for seg_start, seg_end in ac.segment_spans:
+        if seg_start < q_end and q_start < seg_end:
+            if seg_start < k_end and k_start < seg_end:
+                return True
+    return False
+
 
 def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_grps: int = 1):
     """

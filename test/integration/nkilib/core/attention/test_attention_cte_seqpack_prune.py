@@ -198,6 +198,15 @@ SEQPACK_PRUNE_CASES = [
     ("bs2_s2048_4x512_nocausal",   2, 2048, 128, 512,  False),
 ]
 
+# MULTI-SECTION configurations, tracked separately because they are a KNOWN GAP.
+# seqlen > 8192 splits into more than one flash section, which brings the cross-section
+# running-max / running-sum accumulation into play. The MM1+exp prune with identity fill
+# does not yet handle it and produces nan. Kept as xfail so the gap stays visible and
+# flips to a failure the moment someone fixes it without updating this list.
+SEQPACK_PRUNE_MULTISECTION_CASES = [
+    ("s16384_16x1024_nocausal", 1, 16384, 128, 1024, False),
+]
+
 
 @pytest.mark.parametrize("lnc", [1, 2], ids=["lnc1", "lnc2"])
 @pytest.mark.parametrize(
@@ -274,10 +283,17 @@ def test_seqpack_prune_matches_cpu_reference(bs, seqlen, d, seg_spec, causal):
 @pytest.mark.parametrize(
     "seqlen, seg, expected_min_ratio",
     [
-        (4096, 1024, 3.0),   # measured 3.82x
-        (4096, 512, 6.0),    # measured 7.22x
-        (8192, 1024, 6.0),   # measured 7.59x
-        (8192, 512, 12.0),   # measured 14.33x
+        # Floors for the CORRECT implementation (MM1 + exp pruned; MM2 intentionally left
+        # intact so exp_tp_sb is always fully written and PSUM keeps a well-defined first
+        # write). Measured values are given for reference.
+        #
+        # NOTE: earlier, higher floors (3.0/6.0/6.0/12.0) came from an implementation that
+        # ALSO pruned MM2 and was numerically WRONG on hardware. Do not restore them without
+        # a correctness story for PSUM accumulation.
+        (4096, 1024, 1.4),   # measured 1.59x
+        (4096, 512, 1.7),    # measured 1.87x
+        (8192, 1024, 1.6),   # measured 1.77x
+        (8192, 512, 1.7),    # measured 1.87x
     ],
     ids=["s4096_4seg", "s4096_8seg", "s8192_8seg", "s8192_16seg"],
 )
@@ -402,4 +418,33 @@ def test_seqpack_prune_predicate_is_sound(seqlen, seg):
     assert not unsound, (
         f"{len(unsound)} unsound prunes (tile has in-bounds pairs but predicate said skip); "
         f"first few: {unsound[:5]}"
+    )
+
+
+@pytest.mark.xfail(
+    reason="KNOWN GAP: multi-section (seqlen > 8192) flash cross-section accumulation is not "
+           "yet handled by sequence-packing tile pruning; produces nan. Wall-clock and MAC "
+           "savings are large here (2.85x / 3.53x measured), so this is the highest-value "
+           "remaining work.",
+    strict=True,
+)
+@pytest.mark.parametrize(
+    "bs, seqlen, d, seg_spec, causal",
+    [c[1:] for c in SEQPACK_PRUNE_MULTISECTION_CASES],
+    ids=[c[0] for c in SEQPACK_PRUNE_MULTISECTION_CASES],
+)
+def test_seqpack_prune_multisection_output_neutral(bs, seqlen, d, seg_spec, causal):
+    """Same contract as the single-section test, for seqlen > 8192.
+
+    Separated so the known multi-section gap does not mask a regression in the
+    single-section path, and so it fails loudly once fixed (strict xfail).
+    """
+    cu = _cu_from_spec(seqlen, seg_spec)
+    q, k, v = _make_inputs(bs, seqlen, d)
+    bmin, bmax = _bounds_from_cu(cu, seqlen, bs)
+    base, _ = _run_on_device(q, k, v, bmin, bmax, causal, None, 2, f"msb{seqlen}")
+    pruned, _ = _run_on_device(q, k, v, bmin, bmax, causal, cu, 2, f"msp{seqlen}")
+    assert np.array_equal(base, pruned), (
+        f"multi-section prune changed the output: "
+        f"max|delta|={float(np.max(np.abs(base - pruned))):.3e}, cos={_cos(base, pruned):.6f}"
     )
