@@ -68,6 +68,51 @@ explicit PSUM-bank initialization or forced-first-write story. Do not attempt it
 Note: `_FLOAT32_MIN` is **not** a usable fill value here -- it overflowed to `2.5e38` in the
 output once the running-max bias was applied.
 
+## Striped context parallelism (IMPLEMENTED, hardware validation PENDING)
+
+**Why this matters more than the raw numbers above**: `attention_cte` requires
+`cp_striped_input=True` when sequence packing is combined with CP (`attention_cte.py:677` --
+contiguous CP is explicitly unsupported with packing). Until this change, all three predicates
+bailed out to "no pruning" under striped input, so **for any packed workload under context
+parallelism the optimization was completely inert.** Since CP is how long sequences are reached,
+that covered the case that actually matters.
+
+Striped CP distributes the sequence round-robin: local position `i` on rank `r` is global position
+`i * D + r`, `D = global_cp_deg`. A contiguous local range therefore maps to an arithmetic
+progression of stride `D`, not a contiguous global span.
+
+**Prunability survives striping** -- a strided set of 128 local positions still lands in only a
+few segments:
+
+| Global seqlen | segment | D | local len | live tiles | ceiling |
+|---|---|---|---|---|---|
+| 131072 | 1024 | 4 | 32768 | 1.6% | 64x |
+| 131072 | 1024 | 8 | 16384 | 3.1% | 32x |
+| 131072 | 1024 | 16 | 8192 | 6.2% | 16x |
+| 131072 | 4096 | 8 | 16384 | 3.1% | 32x |
+| 131072 | 1536 (unaligned) | 8 | 16384 | 4.2% | 24x |
+| 65536 | 1000 (unaligned) | 8 | 8192 | 9.2% | 10.9x |
+
+**The SPMD constraint, and why this is expressible at all**: one NEFF runs on every rank, and
+`cp_offset` is a *runtime* tensor -- so a compile-time prune decision must not depend on the rank.
+It does not: changing `r` shifts every global position by the same constant `< D`, which cannot
+move a position across a segment boundary **as long as every segment is longer than `D`**. That
+precondition is enforced by `_striped_prune_is_safe()`, which disables pruning (returns "keep
+everything") when any segment is shorter than the CP degree, rather than silently mis-pruning.
+
+Verified at trace time by `verify_striped_cp.py`: **0 unsound prunes and 0 over-conservative tiles
+(the predicate is exact) across 12 configurations**, decision confirmed **rank- and
+ring-step-independent**, and the short-segment guard degrades correctly.
+
+⚠ **Hardware output-neutrality for the striped path is NOT yet run** (capacity). Per the
+validation lesson below, trace-time green is not the gate. Treat striped CP as implemented-but-
+unvalidated until that lands.
+
+**Still blocked upstream for the customer's exact workload**: the ring wrappers assert
+`bound_min/bound_max require use_causal_mask=True` (`ring_attention_fwd.py:995`,
+`ring_attention_bwd.py:133`). A non-causal packed ViT under ring CP therefore cannot pass bounds
+through the wrapper today, independent of anything in this file.
+
 ## Multi-section support (how it was fixed)
 
 Two distinct defects, both specific to sequence packing:
