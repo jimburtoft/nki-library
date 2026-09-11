@@ -26,8 +26,12 @@ so per-rank lengths are the relevant shapes):**
 
 | Config | sections | MAC ratio | **wall-clock** | bit-identical |
 |---|---|---|---|---|
-| 16384 = 16 x 1024 (CP=8 rank of 128K) | 2 | 3.53x | **2.93x** | yes (0/128 groups differ) |
-| 32768 = 32 x 1024 (CP=4 rank of 128K) | 4 | **7.07x** | **5.95x** | yes (0/256 groups differ) |
+| 8192 = 8 x 1024 | 1 | 1.77x | **1.34x** | yes (0/64) |
+| 16384 = 16 x 1024 (CP=8 rank of 128K) | 2 | 3.53x | **2.93x** | yes (0/128) |
+| 32768 = 32 x 1024 (CP=4 rank of 128K) | 4 | 7.07x | **5.95x** | yes (0/256) |
+| 65536 = 64 x 1024 (CP=2 rank of 128K) | 8 | **14.14x** | **12.15x** | yes (0/512) |
+
+Realized efficiency (wall-clock / MAC ratio) *improves* with length: 76%, 83%, 84%, 86%.
 
 Savings grow with sequence length, as expected: the dense grid is O(seqlen^2) while useful work
 is only O(seqlen x segment). **The optimization is most valuable exactly where the customer needs
