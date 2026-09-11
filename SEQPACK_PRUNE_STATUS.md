@@ -68,7 +68,34 @@ explicit PSUM-bank initialization or forced-first-write story. Do not attempt it
 Note: `_FLOAT32_MIN` is **not** a usable fill value here -- it overflowed to `2.5e38` in the
 output once the running-max bias was applied.
 
-## Striped context parallelism (IMPLEMENTED, hardware validation PENDING)
+## Striped context parallelism (IMPLEMENTED but DISABLED -- hardware validation FAILED)
+
+**Current state: `_striped_prune_is_safe()` returns `False` unconditionally for striped input, so
+striped CP takes the pre-existing compute-everything-then-mask path.** That is correct, just not
+optimized. Do not re-enable without a passing device bit-identity run.
+
+**What failed.** Trace-time verification was clean -- 0 unsound prunes, 0 over-conservative tiles,
+decision confirmed rank- and ring-step-independent across 12 configs. Device output-neutrality then
+failed at global 65536 / segment 1024 / D=4 / causal:
+
+| | value |
+|---|---|
+| MAC reduction | 3.52x (so the prune *is* firing) |
+| Q groups differing from unpruned | **124 / 128** |
+| cos(baseline, pruned) | **0.913** |
+| max abs delta | 8.1e-02 |
+
+0.913 is far too low to be accumulation-order rounding, which lands at ~1.0000. There is an
+unexplained interaction between the prune and the striped `cp_offset` masking path.
+
+**A caution about how I nearly mis-read this.** I wrote a CPU reference to decide whether the delta
+was benign reordering, and it printed a reassuring verdict. It was worthless: the *unmodified*
+kernel scored cos 0.126 against that same reference, proving the reference -- not the kernel -- was
+wrong. An oracle that disagrees with known-good code cannot arbitrate anything. The trustworthy
+signal is the original design: **bit-identity against the same kernel with the feature disabled**,
+which needs no semantic model at all.
+
+## Striped context parallelism -- design notes (for whoever resumes this)
 
 **Why this matters more than the raw numbers above**: `attention_cte` requires
 `cp_striped_input=True` when sequence packing is combined with CP (`attention_cte.py:677` --
@@ -104,9 +131,25 @@ Verified at trace time by `verify_striped_cp.py`: **0 unsound prunes and 0 over-
 (the predicate is exact) across 12 configurations**, decision confirmed **rank- and
 ring-step-independent**, and the short-segment guard degrades correctly.
 
-⚠ **Hardware output-neutrality for the striped path is NOT yet run** (capacity). Per the
-validation lesson below, trace-time green is not the gate. Treat striped CP as implemented-but-
-unvalidated until that lands.
+**Two real defects were found and fixed along the way** (both still worth keeping):
+
+1. **Striped with unknown degree would crash.** `ring_attention_fwd.py:1133-1134` gates
+   `cp_offset`/`global_cp_deg` on `use_causal_mask` while forwarding `cp_striped_input`
+   unconditionally, so a *non-causal* ring call arrives with `striped=True, global_cp_deg=None`.
+   The mapping would have dereferenced `None`. Now refuses to prune, since the data really is
+   interleaved and treating it as contiguous would be silently wrong.
+2. **The descriptor's coordinate system was under-specified.** `segment_cu_seqlens` is now
+   documented and asserted to be in **GLOBAL** coordinates -- the same system as
+   `bound_min`/`bound_max`. Without CP that equals `seqlen_q`; under striped CP it is
+   `seqlen_q * global_cp_deg`. The original assert compared against the local length and rejected
+   every legitimate CP call.
+
+**Blocking discovery: non-causal CP is rejected by the CORE kernel.** `attention_cte.py:1610`
+asserts `"CP currently only supports causal attn"`. That is why the ring wrapper withholds
+`global_cp_deg` on its non-causal path -- a deliberate workaround to keep `use_cp` False. So for a
+non-causal packed ViT under ring CP the chain is: wrapper requires causal with bounds
+(`ring_attention_fwd.py:995`) → core kernel requires causal with CP (`:1610`) → the kernel is never
+told the CP degree → striped pruning is unreachable regardless of this file.
 
 **Still blocked upstream for the customer's exact workload**: the ring wrappers assert
 `bound_min/bound_max require use_causal_mask=True` (`ring_attention_fwd.py:995`,

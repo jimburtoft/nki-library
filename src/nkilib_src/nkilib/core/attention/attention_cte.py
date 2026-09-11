@@ -667,9 +667,19 @@ def _attention_cte(
         # A short descriptor would let us prune tiles the device-side bounds still treat as
         # live. Checked here because seqlen_q is only known after shape resolution.
         if segment_spans is not None:
+            # The descriptor is always expressed in GLOBAL sequence coordinates, i.e. the same
+            # coordinate system as bound_min/bound_max. Without CP striping the local shard IS
+            # the whole sequence, so that equals seqlen_q. Under striped CP each rank holds
+            # every cp_deg-th position, so the global length is seqlen_q * cp_deg.
+            expected_global = seqlen_q
+            if cp_striped_input and global_cp_deg is not None and global_cp_deg > 1:
+                expected_global = seqlen_q * global_cp_deg
             kernel_assert(
-                segment_spans[-1][1] == seqlen_q,
-                f"segment_cu_seqlens must end at seqlen_q, got {segment_spans[-1][1]} != {seqlen_q}",
+                segment_spans[-1][1] == expected_global,
+                f"segment_cu_seqlens must be in GLOBAL coordinates and end at "
+                f"{expected_global}, got {segment_spans[-1][1]} "
+                f"(seqlen_q={seqlen_q}, cp_striped_input={cp_striped_input}, "
+                f"global_cp_deg={global_cp_deg})",
             )
         if global_cp_deg is not None and global_cp_deg > 1:
             kernel_assert(
@@ -4111,8 +4121,14 @@ def _local_range_segment_ids(local_start: int, local_end: int, ac: AttnConfig):
                 ids.add(si)
         return ids
     # Striped: walk the arithmetic progression. Bounded by the local range length (<= 512),
-    # so this stays cheap at trace time.
+    # so this stays cheap at trace time. Callers must have checked _striped_prune_is_safe()
+    # first, which rejects an unknown degree -- reaching here with None is a caller bug.
     d = ac.global_cp_deg
+    kernel_assert(
+        d is not None and d >= 1,
+        "striped segment mapping requires a known global_cp_deg; "
+        "call _striped_prune_is_safe() before mapping",
+    )
     for i in range(local_start, local_end):
         g = i * d  # rank 0; rank-independent by the argument above
         for si, (seg_start, seg_end) in enumerate(spans):
@@ -4131,8 +4147,30 @@ def _striped_prune_is_safe(ac: AttnConfig):
     """
     if not ac.cp_striped_input:
         return True
-    d = ac.global_cp_deg
-    if not d or d <= 1:
+    # HARDWARE VALIDATION FAILED for the striped path -- disabled pending investigation.
+    #
+    # Trace-time verification was clean (0 unsound prunes, 0 over-conservative, decision
+    # rank- and ring-step-independent across 12 configs), but device output-neutrality FAILS:
+    # at global 65536 / seg 1024 / D=4 causal, 124 of 128 Q groups differ from the unpruned
+    # kernel, cos(baseline, pruned) = 0.913, max|delta| = 8.1e-02. That is far too large to be
+    # accumulation-order rounding (which lands at ~1.0000), so there is an unexplained
+    # interaction between the prune and the striped cp_offset masking path.
+    #
+    # Returning False here keeps striped CP on the pre-existing compute-everything-then-mask
+    # path, which is correct. Re-enable only when device bit-identity passes -- see
+    # projects/zyphra-troubleshooting/tasks/active/013-striped-cp-hardware-validation.md.
+    return False
+    d = ac.global_cp_deg  # noqa: F841  (unreachable until the striped path is re-enabled)
+    if d is None:
+        # Striped layout with an UNKNOWN degree. The ring wrapper does this on the non-causal
+        # path: it forwards cp_striped_input=True but sets global_cp_deg=None (see
+        # ring_attention_fwd.py, where cp_offset/global_cp_deg are gated on use_causal_mask
+        # while cp_striped_input is forwarded unconditionally).
+        #
+        # We cannot map local -> global without the degree, and treating the data as contiguous
+        # would be WRONG (it is genuinely interleaved), so refuse to prune.
+        return False
+    if d <= 1:
         return True
     return all((seg_end - seg_start) > d for seg_start, seg_end in ac.segment_spans)
 
@@ -4167,6 +4205,7 @@ def _is_first_live_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams, sp: 
     if ac.kvp_group_size > 0 or ac.cp_strided_q_slicing or ac.is_prefix_caching:
         return sp.section_idx == 0
     if not _striped_prune_is_safe(ac):
+        # Includes striped-with-unknown-degree, where we cannot reason about liveness at all.
         return sp.section_idx == 0
     # Scan earlier sections; if any was live for this group, this is not the first.
     for earlier in range(sp.section_idx):
