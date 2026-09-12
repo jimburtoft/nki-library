@@ -144,12 +144,21 @@ ring-step-independent**, and the short-segment guard degrades correctly.
    `seqlen_q * global_cp_deg`. The original assert compared against the local length and rejected
    every legitimate CP call.
 
-**Blocking discovery: non-causal CP is rejected by the CORE kernel.** `attention_cte.py:1610`
-asserts `"CP currently only supports causal attn"`. That is why the ring wrapper withholds
-`global_cp_deg` on its non-causal path -- a deliberate workaround to keep `use_cp` False. So for a
-non-causal packed ViT under ring CP the chain is: wrapper requires causal with bounds
-(`ring_attention_fwd.py:995`) → core kernel requires causal with CP (`:1610`) → the kernel is never
-told the CP degree → striped pruning is unreachable regardless of this file.
+**Non-causal CP is now ENABLED in this kernel (verified on device).** Two asserts previously
+rejected it -- `"CP currently only supports causal attn"` and `"Striped CP requires
+causal_mask=True"`. Both are lifted **for the sequence-packed case only**: packing supplies its own
+per-query mask via `bound_min`/`bound_max`, so the causal term is simply *absent* rather than
+missing, and there is nothing for CP to reconcile against. Also fixed: the bound construction no
+longer adds `cp_offset` to what is a constant sentinel upper bound on the non-causal packed path
+(`range_sel_ubs` is `seqlen_k_active`, not a per-row causal position, so adding the offset inflated
+it meaninglessly).
+
+Verified on trn2 (LNC=2, global 8192, `cp_deg=4`, ranks 0 and 2): compiles, runs, and is
+**bit-identical** with and without the descriptor. Full suite: **40 passed**.
+
+This matters because it removes a restriction I had previously reported as structural. It is a
+parameter-level gate, not an architectural limit -- non-packed non-causal CP remains rejected, as it
+should be, since it genuinely has no mask to fall back on.
 
 **Still blocked upstream for the customer's exact workload**: the ring wrappers assert
 `bound_min/bound_max require use_causal_mask=True` (`ring_attention_fwd.py:995`,

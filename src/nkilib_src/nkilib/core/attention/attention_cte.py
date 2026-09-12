@@ -1617,7 +1617,14 @@ def _compute_tile_parameters(
     # to disable compute-skipping. For strided Q slicing, we do not turn off causal masking since
     # compute can be eliminated from the region that is masked in all ranks.
     atp.is_causal = ac.causal_mask
-    kernel_assert(ac.causal_mask or not ac.use_cp, "CP currently only supports causal attn")
+    # Non-causal CP is allowed WHEN sequence packing supplies the mask. Sequence packing carries
+    # its own per-query bounds via bound_min/bound_max, so the causal term is simply absent rather
+    # than missing -- there is nothing for CP to reconcile against. Verified bit-identical on trn2
+    # (LNC=2, global 8192, cp_deg=4, ranks 0 and 2). Non-packed non-causal CP remains rejected.
+    kernel_assert(
+        ac.causal_mask or not ac.use_cp or ac.is_sequence_packed,
+        "CP currently only supports causal attn (or sequence packing, which carries its own mask)",
+    )
     kernel_assert(ac.causal_mask or not ac.use_swa, "SWA currently only supports causal attn")
     atp.dynamic_sel_mask = False
     if ac.use_cp:
@@ -1638,10 +1645,16 @@ def _compute_tile_parameters(
         atp.dynamic_sel_mask = True
     if ac.cp_striped_input:
         kernel_assert(ac.use_cp, "cp_striped_input requires CP mode (global_cp_deg must be set)")
-        kernel_assert(ac.causal_mask, "Striped CP requires causal_mask=True")
+        kernel_assert(
+            ac.causal_mask or ac.is_sequence_packed,
+            "Striped CP requires causal_mask=True (or sequence packing, which carries its own mask)",
+        )
         kernel_assert(not ac.use_swa, "Striped CP does not yet support SWA")
         kernel_assert(not ac.is_prefix_caching, "Striped CP does not yet support prefix caching")
-        atp.is_causal = True
+        # Striped CP normally forces the causal formulation. A non-causal packed call has no
+        # causal term to force, so leave is_causal alone and let the bounds do the masking.
+        if ac.causal_mask or not ac.is_sequence_packed:
+            atp.is_causal = True
         atp.dynamic_sel_mask = True
     atp.seqlen_k_active_updated = ac.seqlen_k_active
     atp.use_swa_optimized_allocation = (
@@ -1821,7 +1834,10 @@ def _setup_range_select_bounds(
                 offset=ac.seqlen_k_active if seq_packed_non_causal else 0,
             )
 
-        if ac.use_cp:
+        if ac.use_cp and not (ac.is_sequence_packed and not atp.is_causal):
+            # For non-causal sequence packing the iota above is a constant sentinel
+            # (seqlen_k_active), not a per-row causal position, so adding cp_offset would inflate
+            # it meaninglessly. The real upper bound is bound_max, applied by the min() below.
             nisa.tensor_scalar(
                 bufs.range_sel_ubs[...],
                 bufs.range_sel_ubs,
