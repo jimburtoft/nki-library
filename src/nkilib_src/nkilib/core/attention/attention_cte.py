@@ -4100,95 +4100,66 @@ def _has_any_compute_bounds(q_grp: int, k_start_pos: int, k_tile_size: int, ac: 
     k_end = min(k_start_pos + k_tile_size, ac.seqlen_q)
     if q_end <= q_start or k_end <= k_start_pos:
         return True
-    q_segs = _local_range_segment_ids(q_start, q_end, ac)
-    k_segs = _local_range_segment_ids(k_start_pos, k_end, ac)
-    return bool(q_segs & k_segs)
+    # Local coordinates: the layout is block-diagonal, so the tile is live iff some segment owns a
+    # query row in this group AND overlaps the tile's key range.
+    for seg_start, seg_end in _segment_spans_local(ac):
+        if seg_start < q_end and q_start < seg_end:
+            if seg_start < k_end and k_start_pos < seg_end:
+                return True
+    return False
 
-def _local_range_segment_ids(local_start: int, local_end: int, ac: AttnConfig):
-    """Segment ids touched by local positions ``[local_start, local_end)``.
+def _segment_spans_local(ac: AttnConfig):
+    """Segment spans in the LOCAL coordinate system the kernel's mask actually uses.
 
-    Handles both layouts:
+    Taken from the real caller
+    (``test/integration/nkilib/utils/sequence_packing_helpers.py::cu_seqlens_to_striped_bounds``)
+    rather than inferred from the layout's name:
 
-    * **Contiguous** (no CP, or CP without striping): local position ``i`` is global position
-      ``i``, so the range maps to a contiguous global span.
-    * **Striped CP** (``cp_striped_input``): the sequence is distributed round-robin, so local
-      position ``i`` on rank ``r`` is global position ``i * D + r`` where ``D = global_cp_deg``.
-      A contiguous local range therefore maps to an arithmetic progression of stride ``D``
-      spanning ``(local_end - local_start) * D`` globally.
+        local_start = cu_seqlens[i]     // cp_degree
+        local_end   = cu_seqlens[i + 1] // cp_degree
 
-    **Why this can be a compile-time decision at all**: the result must not depend on ``r``,
-    because a single SPMD binary runs on every rank and ``cp_offset`` is a runtime tensor.
-    Changing ``r`` shifts every global position by the same constant ``< D``, which cannot move
-    a position across a segment boundary as long as every segment is longer than ``D``. Callers
-    enforce that via ``_striped_prune_is_safe``, so we may compute with ``r = 0`` and the answer
-    is valid for all ranks. Verified empirically to be rank- and ring-step-independent for
-    D in {2,4,8,16} at segment sizes 1000-4096.
+    Under striped CP with every document boundary a multiple of ``cp_degree``, striping yields an
+    **identical local document layout on every rank**, so the same bound tensors are valid
+    everywhere and in local coordinates the layout is still plain block-diagonal. Scaling the spans
+    by ``1 / cp_degree`` is therefore all that is needed -- no stride walk is involved.
 
-    :param local_start: first local position (inclusive)
-    :param local_end: last local position (exclusive)
+    Why the coordinate system matters: ``nisa.range_select`` compares ``range_start + lane``
+    against the bounds, and the kernel passes ``range_start = k_start_pos``, a **local** tile
+    offset. The bounds must therefore be local too, which is exactly what the caller builds.
+
+    Returns the spans unchanged when not striping, where local == global.
+
     :param ac: AttnConfig
-    :return: set of segment indices into ``ac.segment_spans``
+    :return: list of (start, end_exclusive) in local coordinates
     """
-    spans = ac.segment_spans
-    ids = set()
     if not ac.cp_striped_input:
-        for si, (seg_start, seg_end) in enumerate(spans):
-            if seg_start < local_end and local_start < seg_end:
-                ids.add(si)
-        return ids
-    # Striped: walk the arithmetic progression. Bounded by the local range length (<= 512),
-    # so this stays cheap at trace time. Callers must have checked _striped_prune_is_safe()
-    # first, which rejects an unknown degree -- reaching here with None is a caller bug.
+        return ac.segment_spans
     d = ac.global_cp_deg
-    kernel_assert(
-        d is not None and d >= 1,
-        "striped segment mapping requires a known global_cp_deg; "
-        "call _striped_prune_is_safe() before mapping",
-    )
-    for i in range(local_start, local_end):
-        g = i * d  # rank 0; rank-independent by the argument above
-        for si, (seg_start, seg_end) in enumerate(spans):
-            if seg_start <= g < seg_end:
-                ids.add(si)
-                break
-    return ids
+    return [(seg_start // d, seg_end // d) for seg_start, seg_end in ac.segment_spans]
 
 
 def _striped_prune_is_safe(ac: AttnConfig):
     """May we prune under the current CP layout?
 
-    Striped pruning is rank-independent only while every packed segment is longer than the CP
-    degree (see ``_local_range_segment_ids``). Returns False otherwise, so the caller falls back
-    to computing every tile -- correct, just not optimized.
+    Requires the same precondition the caller's bound builder asserts: **every segment boundary
+    must be a multiple of ``cp_degree``**. That is what makes the local layout identical on all
+    ranks, and therefore what makes a single compile-time decision valid for a single SPMD binary.
+    If a boundary is not divisible the local layout differs per rank, no rank-independent prune
+    exists, and we decline -- falling back to computing every tile, which is correct.
+
+    Also declines on an unknown degree. That should be unreachable through supported entry points
+    (``cp_striped_input`` asserts ``use_cp``), but it is cheap to guard and avoids a crash.
     """
     if not ac.cp_striped_input:
         return True
-    # HARDWARE VALIDATION FAILED for the striped path -- disabled pending investigation.
-    #
-    # Trace-time verification was clean (0 unsound prunes, 0 over-conservative, decision
-    # rank- and ring-step-independent across 12 configs), but device output-neutrality FAILS:
-    # at global 65536 / seg 1024 / D=4 causal, 124 of 128 Q groups differ from the unpruned
-    # kernel, cos(baseline, pruned) = 0.913, max|delta| = 8.1e-02. That is far too large to be
-    # accumulation-order rounding (which lands at ~1.0000), so there is an unexplained
-    # interaction between the prune and the striped cp_offset masking path.
-    #
-    # Returning False here keeps striped CP on the pre-existing compute-everything-then-mask
-    # path, which is correct. Re-enable only when device bit-identity passes -- see
-    # projects/zyphra-troubleshooting/tasks/active/013-striped-cp-hardware-validation.md.
-    return False
-    d = ac.global_cp_deg  # noqa: F841  (unreachable until the striped path is re-enabled)
+    d = ac.global_cp_deg
     if d is None:
-        # Striped layout with an UNKNOWN degree. The ring wrapper does this on the non-causal
-        # path: it forwards cp_striped_input=True but sets global_cp_deg=None (see
-        # ring_attention_fwd.py, where cp_offset/global_cp_deg are gated on use_causal_mask
-        # while cp_striped_input is forwarded unconditionally).
-        #
-        # We cannot map local -> global without the degree, and treating the data as contiguous
-        # would be WRONG (it is genuinely interleaved), so refuse to prune.
         return False
     if d <= 1:
         return True
-    return all((seg_end - seg_start) > d for seg_start, seg_end in ac.segment_spans)
+    return all(
+        seg_start % d == 0 and seg_end % d == 0 for seg_start, seg_end in ac.segment_spans
+    )
 
 
 def _is_first_live_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
@@ -4284,9 +4255,11 @@ def _has_any_compute_bounds_section(q_grp: int, ac: AttnConfig, atp: AttnTilePar
     q_end = min(q_start + _Q_GRP_SZ * num_grps, ac.seqlen_q)
     if q_end <= q_start:
         return False
-    q_segs = _local_range_segment_ids(q_start, q_end, ac)
-    k_segs = _local_range_segment_ids(k_start, k_end, ac)
-    return bool(q_segs & k_segs)
+    for seg_start, seg_end in _segment_spans_local(ac):
+        if seg_start < q_end and q_start < seg_end:
+            if seg_start < k_end and k_start < seg_end:
+                return True
+    return False
 
 
 def _has_any_compute_causal(q_grp: int, k_start_pos: int, ac: AttnConfig, num_grps: int = 1):

@@ -68,34 +68,62 @@ explicit PSUM-bank initialization or forced-first-write story. Do not attempt it
 Note: `_FLOAT32_MIN` is **not** a usable fill value here -- it overflowed to `2.5e38` in the
 output once the running-max bias was applied.
 
-## Striped context parallelism (IMPLEMENTED but DISABLED -- hardware validation FAILED)
+## Striped context parallelism (WORKING, device-verified)
 
-**Current state: `_striped_prune_is_safe()` returns `False` unconditionally for striped input, so
-striped CP takes the pre-existing compute-everything-then-mask path.** That is correct, just not
-optimized. Do not re-enable without a passing device bit-identity run.
+| Config (global / segment / cp_degree) | causal | MAC ratio | bit-identical |
+|---|---|---|---|
+| 32768 / 1024 / 4 | yes | 1.80x | **yes** (0/64) |
+| 32768 / 1024 / 4 | no | 1.87x | **yes** (0/64) |
+| 32768 / 2048 / 8 | yes | 1.65x | **yes** (0/32) |
+| 65536 / 1024 / 4 | no | **3.74x** | **yes** (0/128) |
+| 65536 / 1024 / 8 | yes | 1.80x | **yes** (0/64) |
+| 16384 / 1024 / 2 | no | 1.87x | **yes** (0/64) |
 
-**What failed.** Trace-time verification was clean -- 0 unsound prunes, 0 over-conservative tiles,
-decision confirmed rank- and ring-step-independent across 12 configs. Device output-neutrality then
-failed at global 65536 / segment 1024 / D=4 / causal:
+Plus the non-CP suite: **40 passed**.
 
-| | value |
-|---|---|
-| MAC reduction | 3.52x (so the prune *is* firing) |
-| Q groups differing from unpruned | **124 / 128** |
-| cos(baseline, pruned) | **0.913** |
-| max abs delta | 8.1e-02 |
+### The coordinate contract (this is what took three attempts)
 
-0.913 is far too low to be accumulation-order rounding, which lands at ~1.0000. There is an
-unexplained interaction between the prune and the striped `cp_offset` masking path.
+Read off the library's own bound builder,
+`test/integration/nkilib/utils/sequence_packing_helpers.py::cu_seqlens_to_striped_bounds`:
 
-**A caution about how I nearly mis-read this.** I wrote a CPU reference to decide whether the delta
-was benign reordering, and it printed a reassuring verdict. It was worthless: the *unmodified*
-kernel scored cos 0.126 against that same reference, proving the reference -- not the kernel -- was
-wrong. An oracle that disagrees with known-good code cannot arbitrate anything. The trustworthy
-signal is the original design: **bit-identity against the same kernel with the feature disabled**,
-which needs no semantic model at all.
+```python
+local_start = cu_seqlens[i]     // cp_degree
+local_end   = cu_seqlens[i + 1] // cp_degree
+bound_min[local_start:local_end] = local_start
+bound_max[local_start:local_end] = local_end
+```
 
-## Striped context parallelism -- design notes (for whoever resumes this)
+So bounds are in **LOCAL** coordinates -- global boundaries **divided** by `cp_degree` -- and are
+**identical on every rank**, provided every boundary is a multiple of `cp_degree`. In local
+coordinates the packed layout is still plain block-diagonal.
+
+This is corroborated by `nisa.range_select`'s documented semantics: it compares
+`range_start + lane` against the bounds, and the kernel passes `range_start = k_start_pos`, a
+**local** tile offset. The bounds must therefore be local, which is exactly what the caller builds.
+
+`_segment_spans_local()` implements precisely this: divide the spans by `cp_degree`, then run the
+ordinary contiguous overlap test. `_striped_prune_is_safe()` enforces the divisibility precondition
+and declines otherwise (falling back to computing every tile), because without it the local layout
+differs per rank and no rank-independent compile-time decision exists.
+
+### Two earlier attempts failed, and both failed the same way
+
+1. A **stride-walk model**: local `i` on rank `r` maps to global `i * cp_degree + r`, tested against
+   **global** spans. Wrong coordinate space *and* needlessly complex. Device result: cos 0.51.
+2. A **CPU reference** written to judge whether the resulting delta was benign. It scored cos 0.126
+   against the **unmodified** kernel, so it could not arbitrate anything -- yet it printed a
+   reassuring verdict.
+
+Worse, an isolation test reported "0 unsound prunes, mapping agrees with the mask" -- because it was
+fed the same stride assumption as ground truth. **It confirmed the model against itself.**
+
+**The lesson worth keeping: when a kernel's convention is unclear, read it off a real caller or the
+instruction's documented semantics. Do not infer it from a layout's name, and never let a
+self-authored oracle adjudicate a self-authored model.** The trustworthy check throughout was
+bit-identity against the same kernel with the feature disabled, which requires no semantic model at
+all.
+
+## Striped context parallelism -- design notes (for whoever resumes this)## Striped context parallelism -- design notes (for whoever resumes this)
 
 **Why this matters more than the raw numbers above**: `attention_cte` requires
 `cp_striped_input=True` when sequence packing is combined with CP (`attention_cte.py:677` --

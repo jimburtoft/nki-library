@@ -460,3 +460,124 @@ def test_seqpack_prune_multisection_output_neutral(bs, seqlen, d, seg_spec, caus
         f"multi-section prune changed the output: "
         f"max|delta|={float(np.max(np.abs(base - pruned))):.3e}, cos={_cos(base, pruned):.6f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Striped context parallelism.
+#
+# This is the configuration that matters for reaching long global sequence lengths:
+# attention_cte requires cp_striped_input=True whenever sequence packing is combined with CP.
+#
+# The coordinate contract, taken from the library's own bound builder
+# (test/integration/nkilib/utils/sequence_packing_helpers.py::cu_seqlens_to_striped_bounds):
+#
+#     local_start = cu_seqlens[i]     // cp_degree
+#     local_end   = cu_seqlens[i + 1] // cp_degree
+#
+# i.e. bounds are in LOCAL coordinates (global boundaries divided by cp_degree) and are
+# IDENTICAL on every rank, provided every boundary is a multiple of cp_degree. That is what
+# makes a single compile-time prune decision valid for one SPMD binary.
+#
+# These tests deliberately build bounds with that helper rather than by hand. Two earlier
+# attempts at this failed because the test invented its own coordinate model and then agreed
+# with itself -- see SEQPACK_PRUNE_STATUS.md.
+# ---------------------------------------------------------------------------
+SEQPACK_PRUNE_STRIPED_CASES = [
+    # (id, global_seqlen, segment, cp_degree, causal)
+    ("g32768_seg1024_D4_causal",   32768, 1024, 4, True),
+    ("g32768_seg1024_D4_nocausal", 32768, 1024, 4, False),
+    ("g32768_seg2048_D8_causal",   32768, 2048, 8, True),
+    ("g65536_seg1024_D4_nocausal", 65536, 1024, 4, False),
+    ("g65536_seg1024_D8_causal",   65536, 1024, 8, True),
+    ("g16384_seg1024_D2_nocausal", 16384, 1024, 2, False),
+]
+
+
+def _run_striped(local_len, d, causal, cu, cp_deg, use_seg, lnc, tag):
+    from nki.compiler.ncc_driver import CompileOptions, compile_bir_to_neff
+    from nki.compiler.driver import compile_to_bir
+    from nki.compiler.frontend import TracerFrontend
+    from ....utils.sequence_packing_helpers import cu_seqlens_to_striped_bounds
+
+    bmin1, bmax1 = cu_seqlens_to_striped_bounds(np.asarray(cu), cu[-1], cp_deg)
+    bmin = bmin1.reshape(1, local_len, 1).astype(np.float32)
+    bmax = bmax1.reshape(1, local_len, 1).astype(np.float32)
+    rng = np.random.default_rng(11)
+    q = (rng.standard_normal((1, local_len, d)) * 0.5).astype(np.float32)
+    k = (rng.standard_normal((1, d, local_len)) * 0.5).astype(np.float32)
+    v = (rng.standard_normal((1, local_len, d)) * 0.5).astype(np.float32)
+    inp = dict(q=q, k=k, v=v, bound_min=bmin, bound_max=bmax, scale=1.0, causal_mask=causal,
+               tp_q=True, tp_k=False, tp_out=False,
+               cp_offset=np.zeros((1, 1), dtype=np.int32),
+               global_cp_deg=cp_deg, cp_striped_input=True)
+    if use_seg:
+        inp["segment_cu_seqlens"] = tuple(cu)
+    opts = CompileOptions(target="trn2", lnc=lnc,
+                          output_path=f"/tmp/striped_{tag}.neff",
+                          artifacts_dir=f"/tmp/striped_{tag}_art")
+    bir = compile_to_bir(attention_cte, frontend=TracerFrontend(), inputs=inp, compile_opts=opts)
+    an = [x.name for x in bir.descriptor.input_specs]
+    on = [x.name for x in bir.descriptor.output_specs]
+    ck = compile_bir_to_neff(opts, bir,
+                             [inp[n] for n in an if isinstance(inp.get(n), np.ndarray)], an, on)
+    res = ck.run(**{n: inp[n] for n in an if isinstance(inp.get(n), np.ndarray)})
+    outs = res.outputs
+    arr = outs[0] if isinstance(outs, (list, tuple)) else (
+        list(outs.values())[0] if isinstance(outs, dict) else outs)
+    return np.asarray(arr, np.float32).reshape(local_len, d), int(bir.mac_count)
+
+
+@pytest.mark.parametrize(
+    "global_len, seg, cp_deg, causal",
+    [c[1:] for c in SEQPACK_PRUNE_STRIPED_CASES],
+    ids=[c[0] for c in SEQPACK_PRUNE_STRIPED_CASES],
+)
+def test_seqpack_prune_striped_cp_output_neutral(global_len, seg, cp_deg, causal):
+    """Under striped CP, the descriptor must not change the output.
+
+    Measured MAC reductions at these shapes: 1.65x-3.74x, all bit-identical.
+    """
+    local_len = global_len // cp_deg
+    cu = tuple(range(0, global_len + 1, seg))
+    base, mb = _run_striped(local_len, 128, causal, cu, cp_deg, False, 2, f"b{global_len}_{cp_deg}")
+    pruned, mp = _run_striped(local_len, 128, causal, cu, cp_deg, True, 2, f"p{global_len}_{cp_deg}")
+
+    assert mb > mp, (
+        f"descriptor did not reduce MACs under striped CP ({mb:,} -> {mp:,}); "
+        f"the prune may be silently inert"
+    )
+    if np.array_equal(base, pruned):
+        return
+    groups = _per_group_max_err(base, pruned, local_len)
+    bad = [(g, e) for g, e in groups if e > 0.0]
+    pytest.fail(
+        f"striped-CP prune changed the output (must be bit-identical).\n"
+        f"  global={global_len} seg={seg} cp_deg={cp_deg} causal={causal} local={local_len}\n"
+        f"  MACs {mb:,} -> {mp:,}\n"
+        f"  max|delta| = {float(np.max(np.abs(base - pruned))):.6e}\n"
+        f"  cos = {_cos(base, pruned):.8f}\n"
+        f"  {len(bad)}/{len(groups)} Q groups differ: "
+        + ", ".join(f"grp{g}:{e:.2e}" for g, e in bad[:10])
+    )
+
+
+def test_seqpack_prune_striped_guard_requires_divisible_boundaries():
+    """Boundaries not divisible by cp_degree must disable pruning, not mis-prune.
+
+    That precondition is what makes the local layout identical on every rank; without it no
+    rank-independent compile-time decision exists.
+    """
+    from nkilib.core.attention.attention_cte import _striped_prune_is_safe
+
+    class _AC:
+        cp_striped_input = True
+        global_cp_deg = 8
+        segment_spans = None
+
+    ac = _AC()
+    ac.segment_spans = [(0, 1024), (1024, 2048)]
+    assert _striped_prune_is_safe(ac) is True, "divisible boundaries should permit pruning"
+    ac.segment_spans = [(0, 1000), (1000, 2048)]
+    assert _striped_prune_is_safe(ac) is False, "non-divisible boundary must disable pruning"
+    ac.global_cp_deg = None
+    assert _striped_prune_is_safe(ac) is False, "unknown degree must disable pruning"
