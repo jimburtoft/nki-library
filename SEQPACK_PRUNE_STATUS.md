@@ -79,7 +79,7 @@ output once the running-max bias was applied.
 | 65536 / 1024 / 8 | yes | 1.80x | **yes** (0/64) |
 | 16384 / 1024 / 2 | no | 1.87x | **yes** (0/64) |
 
-Plus the non-CP suite: **40 passed**.
+Full suite: **47 passed, 0 failed** (40 non-CP + 6 striped output-neutrality + 1 guard).
 
 ### The coordinate contract (this is what took three attempts)
 

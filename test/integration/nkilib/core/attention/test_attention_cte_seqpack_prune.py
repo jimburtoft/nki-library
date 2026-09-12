@@ -497,7 +497,19 @@ def _run_striped(local_len, d, causal, cu, cp_deg, use_seg, lnc, tag):
     from nki.compiler.ncc_driver import CompileOptions, compile_bir_to_neff
     from nki.compiler.driver import compile_to_bir
     from nki.compiler.frontend import TracerFrontend
-    from ....utils.sequence_packing_helpers import cu_seqlens_to_striped_bounds
+    # Relative import when run inside the test package; path fallback when this file is run
+    # standalone (the full harness pulls in internal-only deps such as aws_embedded_metrics).
+    try:
+        from ....utils.sequence_packing_helpers import cu_seqlens_to_striped_bounds
+    except ImportError:
+        import os
+        import sys
+
+        _here = os.path.dirname(os.path.abspath(__file__))
+        _utils = os.path.normpath(os.path.join(_here, "..", "..", "utils"))
+        if _utils not in sys.path:
+            sys.path.insert(0, _utils)
+        from sequence_packing_helpers import cu_seqlens_to_striped_bounds
 
     bmin1, bmax1 = cu_seqlens_to_striped_bounds(np.asarray(cu), cu[-1], cp_deg)
     bmin = bmin1.reshape(1, local_len, 1).astype(np.float32)
@@ -577,7 +589,10 @@ def test_seqpack_prune_striped_guard_requires_divisible_boundaries():
     ac = _AC()
     ac.segment_spans = [(0, 1024), (1024, 2048)]
     assert _striped_prune_is_safe(ac) is True, "divisible boundaries should permit pruning"
-    ac.segment_spans = [(0, 1000), (1000, 2048)]
+    # 1004 % 8 == 4, so the local layout would differ per rank and no rank-independent
+    # compile-time decision exists. (Note 1000 % 8 == 0 -- picking a genuinely indivisible
+    # boundary matters for this test to mean anything.)
+    ac.segment_spans = [(0, 1004), (1004, 2048)]
     assert _striped_prune_is_safe(ac) is False, "non-divisible boundary must disable pruning"
     ac.global_cp_deg = None
     assert _striped_prune_is_safe(ac) is False, "unknown degree must disable pruning"
