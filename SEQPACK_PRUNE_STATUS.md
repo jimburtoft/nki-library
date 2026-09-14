@@ -35,7 +35,42 @@
 >    power-of-2 bucket, or sort segments so only the multiset matters -- 165 multisets vs 47M
 >    ordered layouts). This is a caller change, not a kernel change.
 >
-> Probes: `task010/prototype/recompile_probe.py`, `quant_probe.py`.
+> Probes: `task010/prototype/recompile_probe.py`, `quant_probe.py`,
+> `tile_rounding_analysis.py`, `bench_tile_rounding_device.py`.
+>
+> ### Tile-grid rounding: measured on device, and it does NOT help
+>
+> The natural idea is to round document boundaries out to the 512-key tile grid, so layouts
+> differing only within a tile share a NEFF. An analytical tile-count model predicted this was
+> free-to-positive (~1.07x throughput, 3x fewer NEFFs). **The device disagrees.**
+>
+> seqlen 16384, 12 random variable-document batches, LNC=2, figure of merit is **real (unpadded)
+> tokens/s** -- padding is not useful work:
+>
+> | strategy | NEFFs | real tok | latency | real Mtok/s | net |
+> |---|---|---|---|---|---|
+> | no descriptor (no pruning) | 1 | 15735 | 2.181 ms | 7.21 | 0.39x |
+> | **exact boundaries** | 12 | 15608 | 0.848 ms | 18.40 | **1.00x** |
+> | **sort only, no rounding** | 12 | 15608 | 0.834 ms | 18.71 | **1.02x** |
+> | round 256 + sort | 12 | 14354 | 0.821 ms | 17.48 | 0.95x |
+> | round 512 + sort | 11 | 12319 | 0.805 ms | 15.31 | **0.83x** |
+> | round 1024 + sort | 7 | 10191 | 0.800 ms | 12.74 | 0.69x |
+>
+> **Why the model was wrong**: it treated live-tile count as proportional to time. On device
+> latency is nearly flat across grids (0.848 -> 0.800 ms, only -6%) while padding destroys real
+> tokens fast (-21% at grid 512). The kernel is **not tile-bound at this shape**, so the tile
+> saving is not cashable while the padding cost is immediate. Rounding trades 17-31% of real
+> throughput for a modest NEFF reduction.
+>
+> **What the same run establishes**: pruning itself is worth **2.58x latency / 2.55x real-token
+> throughput** (2.181 -> 0.848 ms) on **variable** document layouts. That is the headline, and it
+> is now device-measured rather than inferred.
+>
+> **Sorting alone is free** (+2%, no padding) and is the part that can bound the NEFF count, since
+> only the multiset of document sizes matters. In this 12-batch sample every multiset was distinct
+> so no collapse was visible; a larger sweep is needed to quantify it, but it cannot hurt.
+>
+> **Recommendation: exact boundaries plus caller-side sorting. Do not round.**
 
 Supersedes the earlier `HW_VALIDATION_WARNING.md`. The multi-section gap noted in the previous
 revision of this file is now **fixed**.
