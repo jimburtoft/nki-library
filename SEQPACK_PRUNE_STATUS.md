@@ -241,6 +241,62 @@ independently and cannot reproduce modulo SBUF aliasing or PSUM accumulation.
 hardware output-neutrality test first, on one small config, before investing in breadth.** The
 local ladder took hours; the hardware run that falsified it took 90 seconds.
 
+## Coordination with the 128K max-seqlen work (Task 009)
+
+Another agent (`opus-seqlen-128k`) is working on the same file for a different goal: reaching
+seqlen 131072. There is **no git conflict today** -- that work has no branch on this fork yet -- but
+there is one **design interaction that must not be lost**.
+
+### The collision: rolling the loop nest would delete this optimization
+
+Task 009's most promising mitigation is converting `attention_cte`'s **unrolled Python loop nest**
+into a **rolled `nl.fori_loop`**, because the 128K ceiling is a trace-time/`colz` blob-size problem
+(their gates A-E all pass on GA, colz flat at +0.2% for 8x trips).
+
+**But everything in this file depends on the loops being unrolled.** Compile-time tile pruning *is*
+trace-time specialization:
+
+- `_has_any_compute_bounds` / `_has_any_compute_bounds_section` / `_is_first_live_section` --
+  ~20 call sites, all plain-Python `if`/`continue` on loop indices
+- `_segment_spans_local()` iteration at two sites
+- and the pre-existing `_has_any_compute_causal` / `_has_any_compute_swa` skips this work is modelled on
+
+A rolled loop must convert every one of those to **runtime predication**, at which point the tiles
+are still *issued* and the saving disappears. Task 009's own notes say as much: rolling *"gives up
+causal tile pruning (~half the tiles)"*. The same applies, in full, to bound-based pruning.
+
+### Why the two are not simply in opposition
+
+The tension is real but narrower than it looks:
+
+- **Rolling helps the causal long-context case**, where the ceiling binds and pruning is worth ~2x.
+- **Pruning helps the non-causal packed case**, where the ceiling binds *less* (Task 009 notes
+  *"non-causal ViT pays little"*) and pruning is worth **3.5x-14x**.
+
+For a **non-causal packed ViT** -- the workload driving this -- pruning is worth substantially more
+than rolling, and pruning already reaches 65536 today. So the sequencing that preserves both is:
+
+1. Prefer **query chunking** (Task 009's validated caller-side mitigation) to reach 128K, since it
+   leaves the loop nest unrolled and keeps pruning intact.
+2. Treat **rolling as an upstream ask with a PoC**, as Task 009 already frames it -- and if it is
+   ever adopted, it needs a `segment_cu_seqlens`-aware story, or a packed workload silently loses
+   3.5x-14x.
+
+**Do not land a rolled loop nest on this branch without re-running
+`test_attention_cte_seqpack_prune.py`.** The MAC-floor assertions in that suite are exactly the
+tripwire: they fail if pruning becomes inert, which is the failure mode rolling would cause.
+
+### Non-overlapping parts (safe to develop in parallel)
+
+Task 009's other three mitigations do not touch anything here:
+
+| 009 item | Where | Overlaps this work? |
+|---|---|---|
+| `colz` uint32 overflow | closed-source `_nki` C++ | no (AWS ticket) |
+| `_MAX_SEQLEN` warn -> assert | this file, but a different region | **no line overlap** (verified) |
+| lowering-stampede pre-lock | framework `nki_kernel.py` | no |
+| query chunking | caller / trainer | no |
+
 ## Reproduce
 
 ```bash
