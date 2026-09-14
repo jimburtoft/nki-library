@@ -1,6 +1,41 @@
 # Sequence-packing tile pruning -- status
 
-**Correct and hardware-validated, including multi-section (seqlen > 8192).**
+**Correct and hardware-validated, including multi-section (seqlen > 8192) and striped CP.**
+
+> ## ⚠ APPLICABILITY LIMIT: ONE NEFF PER PACKING LAYOUT
+>
+> `segment_cu_seqlens` is a **trace-time** parameter (the NKI tracer treats tuples as shape
+> parameters), so **every distinct packing layout produces a distinct graph and therefore a
+> distinct NEFF.** Measured, compile-only, at seqlen 4096 with 4 segments:
+>
+> | | distinct graphs across 12 random layouts |
+> |---|---|
+> | without descriptor | **1** (one NEFF serves every layout) |
+> | with descriptor | **12** (a NEFF per layout) |
+>
+> MAC counts differ per layout too (2.75G / 2.82G / 2.95G) -- the graph is genuinely specialized
+> to the boundary positions, which is both why it is fast and why it cannot be layout-agnostic.
+>
+> **Consequence:**
+>
+> | Workload | Verdict |
+> |---|---|
+> | **Fixed**-resolution packing (same layout every step, e.g. always 8 x 1024) | **1 NEFF. Full benefit. Use it.** |
+> | **Variable**-resolution packing (layout changes per batch) | **Not viable as built** -- recompile per batch. For 4 resolutions filling 8192 there are ~47M possible ordered layouts. |
+>
+> **Tested mitigation that does NOT work**: quantizing descriptor boundaries to the 512-key tile
+> grid. 12 layouts still produced 12 graphs -- the cut positions retain ~7 distinct slots each, so
+> the combinatorics survive. Coarser buckets (2048) would collapse the count but gut the pruning.
+>
+> **Mitigations that do work:**
+> 1. A **uniform `segment_len: int`** parameter instead of full `cu_seqlens` -- one integer, so one
+>    NEFF per segment length. Covers fixed-resolution packing exactly. **Not yet implemented; this
+>    is the highest-value next step.**
+> 2. **Caller-side bucketing**: canonicalize layouts to a small fixed set (pad each image to a
+>    power-of-2 bucket, or sort segments so only the multiset matters -- 165 multisets vs 47M
+>    ordered layouts). This is a caller change, not a kernel change.
+>
+> Probes: `task010/prototype/recompile_probe.py`, `quant_probe.py`.
 
 Supersedes the earlier `HW_VALIDATION_WARNING.md`. The multi-section gap noted in the previous
 revision of this file is now **fixed**.
