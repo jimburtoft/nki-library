@@ -140,14 +140,26 @@ output once the running-max bias was applied.
 
 ## Striped context parallelism (WORKING, device-verified)
 
-| Config (global / segment / cp_degree) | causal | MAC ratio | bit-identical |
-|---|---|---|---|
-| 32768 / 1024 / 4 | yes | 1.80x | **yes** (0/64) |
-| 32768 / 1024 / 4 | no | 1.87x | **yes** (0/64) |
-| 32768 / 2048 / 8 | yes | 1.65x | **yes** (0/32) |
-| 65536 / 1024 / 4 | no | **3.74x** | **yes** (0/128) |
-| 65536 / 1024 / 8 | yes | 1.80x | **yes** (0/64) |
-| 16384 / 1024 / 2 | no | 1.87x | **yes** (0/64) |
+**Wall-clock measured** (trn2, LNC=2, d=128, 10 iters, bit-identical re-checked in the same run):
+
+| Config (global / segment / cp_deg) | causal | local | MAC | base | pruned | **wall-clock** | realized |
+|---|---|---|---|---|---|---|---|
+| 32768 / 1024 / 4 | yes | 8192 | 1.80x | 0.332 ms | 0.239 ms | **1.39x** | 77% |
+| 32768 / 1024 / 4 | no | 8192 | 1.87x | 0.516 ms | 0.389 ms | **1.33x** | 71% |
+| 65536 / 1024 / 4 | no | 16384 | 3.74x | 2.184 ms | 0.730 ms | **2.99x** | 80% |
+| 65536 / 1024 / 8 | yes | 8192 | 1.80x | 0.332 ms | 0.239 ms | **1.39x** | 77% |
+| **131072 / 1024 / 8** (CP=8 rank of 128K) | no | 16384 | 3.74x | 2.186 ms | 0.730 ms | **2.99x** | 80% |
+| **131072 / 1024 / 4** (CP=4 rank of 128K) | no | 32768 | 7.48x | 8.631 ms | 1.421 ms | **6.07x** | 81% |
+| **65536 / VARIABLE docs / 4** (91 docs) | no | 16384 | 3.48x | 2.185 ms | 0.787 ms | **2.78x** | 80% |
+| **131072 / VARIABLE docs / 8** (170 docs) | no | 16384 | 3.54x | 2.185 ms | 0.790 ms | **2.76x** | 78% |
+
+**8/8 bit-identical.** Realized efficiency is a consistent **71-81%** of the MAC ratio.
+
+The **VARIABLE-document** rows are the ones to quote for a real ViT -- uniform segments are a best
+case. Note they hold up well (2.76-2.78x vs 2.99x uniform at the same shape), so realistic document
+size mixes cost little.
+
+Earlier MAC-only figures for reference (32768/2048/8: 1.65x; 16384/1024/2: 1.87x).
 
 Full suite: **47 passed, 0 failed** (40 non-CP + 6 striped output-neutrality + 1 guard).
 
