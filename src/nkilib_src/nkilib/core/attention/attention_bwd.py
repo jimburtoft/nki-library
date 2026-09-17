@@ -35,6 +35,7 @@ import nki.language as nl
 
 from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil
+from .attention_cte import check_body_size
 
 _FLOAT32_MIN: float = -3.4028235e38  # Value for masked attention positions
 
@@ -317,6 +318,22 @@ def validate_inputs(
         )
         kernel_assert(bound_min.dtype == nl.float32, f"bound_min must be float32, got {bound_min.dtype}")
         kernel_assert(bound_max.dtype == nl.float32, f"bound_max must be float32, got {bound_max.dtype}")
+
+    # HARD body-size precondition -- see check_body_size in attention_cte.py.
+    # The backward body is ~1.5x the forward's and sequence packing adds ~10%, so
+    # BACKWARD is the binding constraint for training: a shape whose forward
+    # compiles fine can still fail here. Assert in milliseconds instead of letting
+    # the backend emit an opaque colz error after tens of minutes.
+    bs, nheads, _, seqlen_q = q_ref.shape
+    seqlen_k = k_ref.shape[3]
+    check_body_size(
+        bs=bs * nheads,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        kernel_name="attention_bwd",
+        is_backward=True,
+        is_sequence_packed=bound_min is not None,
+    )
 
 
 @dataclass
