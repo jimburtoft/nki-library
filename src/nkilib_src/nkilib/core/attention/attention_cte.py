@@ -215,6 +215,28 @@ def attention_cte(
     bound_min: Optional[nl.NkiTensor] = None,
     bound_max: Optional[nl.NkiTensor] = None,
     segment_cu_seqlens: Optional[tuple] = None,
+    # Uniform packed-segment length, as an alternative to `segment_cu_seqlens` for
+    # fixed-resolution packing. Mutually exclusive with it.
+    #
+    # WHAT THIS IS: **pure API sugar over a uniform `segment_cu_seqlens`.** Measured on trn2, the
+    # lowered IR is BYTE-IDENTICAL between `segment_len=N` and `segment_cu_seqlens=(0,N,2N,...)`
+    # (module.mlir sha256 matches at 1024/256, 2048/512, 4096/1024), and MAC counts are equal.
+    # Passing this parameter therefore compiles **no fewer NEFFs** than the descriptor would for
+    # the same uniform layout -- do not describe it as a compilation win over the descriptor.
+    #
+    # The NEFF reduction comes from the LAYOUT BEING UNIFORM, not from this parameter. Measured at
+    # a fixed seqlen=4096: 8 different variable layouts force 8 distinct graphs, whereas one
+    # `segment_len` traced 8 times forces 1. A caller passing a uniform tuple gets the same 1.
+    #
+    # What it actually buys, which is why it is still worth having:
+    #   - one integer instead of a caller-built cumulative tuple
+    #   - a non-uniform layout is UNREPRESENTABLE, so it cannot be passed by accident
+    #   - divisibility and striped-CP preconditions are checked once, centrally, with a clear
+    #     message instead of failing later inside `_striped_prune_is_safe`
+    #
+    # GLOBAL sequence coordinates, like `segment_cu_seqlens`: without CP that is `seqlen_q`; under
+    # striped CP the global length is `seqlen_q * global_cp_deg`, and `segment_len` must divide it.
+    segment_len: Optional[int] = None,
     cp_striped_input: bool = False,
     skip_output_normalization: bool = False,
     position_bias: Optional[nl.NkiTensor] = None,
@@ -433,6 +455,7 @@ def attention_cte(
         bound_min=bound_min,
         bound_max=bound_max,
         segment_cu_seqlens=segment_cu_seqlens,
+        segment_len=segment_len,
         cp_striped_input=cp_striped_input,
         skip_output_normalization=skip_output_normalization,
         position_bias=position_bias,
@@ -464,6 +487,28 @@ def _attention_cte(
     bound_min: Optional[nl.NkiTensor] = None,
     bound_max: Optional[nl.NkiTensor] = None,
     segment_cu_seqlens: Optional[tuple] = None,
+    # Uniform packed-segment length, as an alternative to `segment_cu_seqlens` for
+    # fixed-resolution packing. Mutually exclusive with it.
+    #
+    # WHAT THIS IS: **pure API sugar over a uniform `segment_cu_seqlens`.** Measured on trn2, the
+    # lowered IR is BYTE-IDENTICAL between `segment_len=N` and `segment_cu_seqlens=(0,N,2N,...)`
+    # (module.mlir sha256 matches at 1024/256, 2048/512, 4096/1024), and MAC counts are equal.
+    # Passing this parameter therefore compiles **no fewer NEFFs** than the descriptor would for
+    # the same uniform layout -- do not describe it as a compilation win over the descriptor.
+    #
+    # The NEFF reduction comes from the LAYOUT BEING UNIFORM, not from this parameter. Measured at
+    # a fixed seqlen=4096: 8 different variable layouts force 8 distinct graphs, whereas one
+    # `segment_len` traced 8 times forces 1. A caller passing a uniform tuple gets the same 1.
+    #
+    # What it actually buys, which is why it is still worth having:
+    #   - one integer instead of a caller-built cumulative tuple
+    #   - a non-uniform layout is UNREPRESENTABLE, so it cannot be passed by accident
+    #   - divisibility and striped-CP preconditions are checked once, centrally, with a clear
+    #     message instead of failing later inside `_striped_prune_is_safe`
+    #
+    # GLOBAL sequence coordinates, like `segment_cu_seqlens`: without CP that is `seqlen_q`; under
+    # striped CP the global length is `seqlen_q * global_cp_deg`, and `segment_len` must divide it.
+    segment_len: Optional[int] = None,
     cp_striped_input: bool = False,
     skip_output_normalization: bool = False,
     k_cache_sbuf: Optional[List[nl.NkiTensor]] = None,
@@ -576,6 +621,17 @@ def _attention_cte(
     # Compile-time segment layout for sequence packing. Trace-time metadata that
     # mirrors what bound_min/bound_max encode on the device; enables tile pruning.
     segment_spans = None
+    kernel_assert(
+        segment_cu_seqlens is None or segment_len is None,
+        "pass either segment_cu_seqlens or segment_len, not both",
+    )
+    # Mirror the descriptor's requirement. Without this, `segment_len` supplied on its own would be
+    # silently ignored: the synthesis below sits inside `if is_sequence_packed:`, so a caller who
+    # forgot the bound tensors would get no pruning and no diagnostic.
+    kernel_assert(
+        segment_len is None or is_sequence_packed,
+        "segment_len requires bound_min/bound_max (it describes the same layout)",
+    )
     if segment_cu_seqlens is not None:
         kernel_assert(
             is_sequence_packed,
@@ -672,6 +728,32 @@ def _attention_cte(
             f"bound_max shape must be (batch, seqlen_q, 1)=({batch_size}, {seqlen_q}, 1), got {bound_max.shape}",
         )
         kernel_assert(not is_prefix_caching, "is_sequence_packed is not supported with prefix caching")
+
+        # Uniform-segment path: synthesize the spans here, because it needs the resolved seqlen_q.
+        # One integer in, so the emitted graph depends only on (seqlen, segment_len) -- which is the
+        # entire point: a fixed-resolution packed workload gets ONE NEFF instead of one per layout.
+        if segment_len is not None:
+            _global_len = seqlen_q
+            if cp_striped_input and global_cp_deg is not None and global_cp_deg > 1:
+                _global_len = seqlen_q * global_cp_deg
+            kernel_assert(segment_len > 0, "segment_len must be positive")
+            kernel_assert(
+                _global_len % segment_len == 0,
+                "segment_len must divide the global sequence length",
+            )
+            if cp_striped_input and global_cp_deg is not None and global_cp_deg > 1:
+                # Same precondition _striped_prune_is_safe enforces for the descriptor path: every
+                # boundary must be a multiple of cp_degree, or the local layout differs per rank and
+                # no single compile-time decision is valid across an SPMD launch.
+                kernel_assert(
+                    segment_len % global_cp_deg == 0,
+                    "under striped CP, segment_len must be a multiple of global_cp_deg",
+                )
+            segment_spans = []
+            _pos = 0
+            while _pos < _global_len:
+                segment_spans.append((_pos, _pos + segment_len))
+                _pos = _pos + segment_len
         # The compile-time descriptor, when supplied, must cover the whole query sequence.
         # A short descriptor would let us prune tiles the device-side bounds still treat as
         # live. Checked here because seqlen_q is only known after shape resolution.
