@@ -56,6 +56,8 @@ def attention_bwd(
     sliding_window: Optional[int] = None,
     transpose_dv: bool = False,
     cp_offset: int = 0,
+    # Compile-time packed-sequence layout (tuple cu_seqlens). See Task 015: INCORRECT on device.
+    segment_cu_seqlens: Optional[tuple] = None,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor, nl.NkiTensor]:
     """
     Flash Attention backward pass kernel.
@@ -210,6 +212,7 @@ def attention_bwd(
         sliding_window,
         transpose_dv,
         cp_offset,
+        segment_cu_seqlens,
     )
 
     if sinks_ref is not None:
@@ -855,6 +858,7 @@ def get_required_tiles_mask(
     k_seq_tile_size: int,
     sliding_window: int,
     cp_offset: int = 0,
+    segment_spans: Optional[List[Tuple[int, int]]] = None,
 ) -> Tuple[List[bool], bool]:
     """
     Determine which tiles require computation based on causal and sliding window masks.
@@ -869,6 +873,9 @@ def get_required_tiles_mask(
         k_seq_tile_size (int): Size of each key tile.
         sliding_window (int): Sliding window size.
         cp_offset (int): Context parallelism offset for Q positions.
+        segment_spans (Optional[List[Tuple[int, int]]]): Compile-time packed-sequence layout as
+            [(start, end_exclusive), ...]. Trace-time metadata mirroring bound_min/bound_max.
+            NOTE: this produces NUMERICALLY INCORRECT gradients on device -- see Task 015.
 
     Returns:
         Tuple[List[bool], bool]: Tuple of (tile_required, any_tile_required):
@@ -879,6 +886,22 @@ def get_required_tiles_mask(
     any_tile_required = False
 
     for i_q_tile_group_size in range(q_tile_group_size):
+        # Sequence-packing bounds skipping, applied to both branches. Folded here so
+        # any_tile_required stays truthful and existing downstream guards keep working.
+        bounds_ok = True
+        if segment_spans is not None:
+            q_lo = (i_q_seq_tile + i_q_tile_group_size) * q_seq_tile_size + cp_offset
+            q_hi = q_lo + q_seq_tile_size
+            k_lo = k_seq_start + i_k_seq_tile * k_seq_tile_size
+            k_hi = k_lo + k_seq_tile_size
+            bounds_ok = False
+            # No tuple unpacking in the loop target: the NKI HOP tracer rejects it with
+            # "error: expecting simple variable". Index instead.
+            for _seg in segment_spans:
+                if _seg[0] < q_hi and q_lo < _seg[1] and _seg[0] < k_hi and k_lo < _seg[1]:
+                    bounds_ok = True
+                    break
+
         # Tile-level early exit: Skip tiles where no query token can attend to any key token.
         if use_causal_mask:
             # Causal: max query position >= min key position
@@ -893,11 +916,12 @@ def get_required_tiles_mask(
                 earliest_attendable_pos = q_tile_min_pos - sliding_window + 1
                 _tile_required = _tile_required and (k_tile_max_pos >= earliest_attendable_pos)
 
+            _tile_required = _tile_required and bounds_ok
             tile_required.append(_tile_required)
             any_tile_required = any_tile_required or _tile_required
         else:
-            tile_required.append(True)
-            any_tile_required = True
+            tile_required.append(bounds_ok)
+            any_tile_required = any_tile_required or bounds_ok
 
     return tile_required, any_tile_required
 
@@ -1153,6 +1177,7 @@ def flash_attn_bwd(
     sliding_window: int,
     transpose_dv: bool = False,
     cp_offset: int = 0,
+    segment_cu_seqlens: Optional[tuple] = None,
 ) -> None:
     """
     Flash attention backward pass.
@@ -1197,6 +1222,19 @@ def flash_attn_bwd(
     bs = cfg.bs
     seqlen_k = cfg.seqlen_k
     seqlen_q = cfg.seqlen_q
+
+    segment_spans = None
+    if segment_cu_seqlens is not None:
+        kernel_assert(bound_min is not None, "segment_cu_seqlens requires bound_min/bound_max")
+        # No comprehensions: the NKI HOP tracer rejects them ("unsupported expression").
+        _cu = []
+        for _x in segment_cu_seqlens:
+            _cu.append(int(_x))
+        kernel_assert(len(_cu) >= 2 and _cu[0] == 0, "segment_cu_seqlens must start at 0")
+        kernel_assert(_cu[-1] == seqlen_q, "segment_cu_seqlens must end at seqlen_q")
+        segment_spans = []
+        for _i in range(len(_cu) - 1):
+            segment_spans.append((_cu[_i], _cu[_i + 1]))
     nheads_kv = cfg.nheads_kv
     nheads_per_kv_head = cfg.nheads_per_kv_head
 
@@ -1515,6 +1553,7 @@ def flash_attn_bwd(
                             k_seq_tile_size,
                             sliding_window,
                             cp_offset,
+                            segment_spans,
                         )
 
                         if any_tile_required:
