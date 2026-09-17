@@ -400,6 +400,39 @@ packed, non-causal): baseline and pruned both run and are **bit-identical, max|d
 **If you add code to this kernel, test it through `wrap_nki`, not only through `compile_to_bir`.**
 The direct path is more permissive and will silently accept code the supported path rejects.
 
+## Backward pass (`attention_bwd`) — validated and measured
+
+Same `segment_cu_seqlens` parameter, threaded into `get_required_tiles_mask`. Validated on Beta 5
+via `wrap_nki(attention_bwd)[lnc]`, gating both baselines against the autograd-verified
+`attention_bwd_torch_ref` before reporting any prune result:
+
+| config | base | pruned | **speedup** | bit-identical |
+|---|---|---|---|---|
+| 1024 = 4 x 256 | 0.317 ms | 0.277 ms | **1.15x** | yes |
+| 2048 = 2 x 1024 | 0.641 ms | 0.502 ms | **1.28x** | yes |
+| 2048 = 8 x 256 | 0.606 ms | 0.347 ms | **1.75x** | yes |
+| 4096 = 4 x 1024 | 1.651 ms | 0.672 ms | **2.46x** | yes |
+| 4096 = 16 x 256 | 1.687 ms | 0.538 ms | **3.14x** | yes |
+| 2048 single segment (**control**) | 0.672 ms | 0.653 ms | 1.03x | yes |
+
+Speedup rises with segment count and with sequence length, both expected. dQ/dK/dV baselines match
+the oracle at **cos 1.000000000**.
+
+### ⚠ Timing `wrap_nki` requires a forced device sync
+
+`wrap_nki` dispatch is **asynchronous**, so a bare `time.time()` around the call measures *enqueue*
+cost, not execution. A first attempt at these numbers produced 0.063-0.081 ms for seqlen 1024-4096
+— *faster than the forward pass at the same shapes*, which is impossible — and reported a flat
+0.95x-1.15x with **the single-segment control "winning" at 1.15x**. That control is the tell: a
+1-segment layout has nothing to prune, so anything far from 1.0x means the measurement is noise.
+
+Fix: read one output element back to CPU inside the timed region
+(`float(out.flatten()[0].to("cpu"))`). The forward numbers elsewhere in this file used
+`CompiledKernel.benchmark()`, which handles this internally.
+
+**Always include a no-op control in a speedup sweep.** It cost nothing and it caught a false
+negative that would otherwise have been reported as "backward pruning gives no benefit".
+
 ## Reproduce
 
 ```bash
