@@ -168,6 +168,224 @@ _MAX_HEAD_DIM = 512  # max supported head dim (d)
 _MIN_GLOBAL_CP_DEGREE = 1  # minimum context parallel degree
 _MAX_GLOBAL_CP_DEGREE = 32  # minimum context parallel degree
 
+"""
+Kernel BODY SIZE limit (hard) -- distinct from the "max tested" values above.
+
+The compiler serializes the kernel body into a `.colz` container whose blob
+offsets are uint32, so the body cannot exceed 4 GiB. Past it, compilation FAILS
+with:
+
+    <unknown>:0: error: colz: body blob exceeds uint32 offset range
+    RuntimeError: BIR emission failed
+
+This is a HARD limit, not a "not tested" warning: waiting longer, adding host RAM
+or adding swap does not help. Because the tile loops are fully unrolled at trace
+time, the body grows as
+
+    body_bytes ~= C * (bs * nheads) * seqlen_q * seqlen_k
+
+`C` measured on SDK 2.32 GA (neuronx-cc 2.27.5334.0), bf16, non-causal, trn2, by
+compiling a sweep and reading the emitted module size (fits +/-2.7% over
+seqlen 16384..131072):
+
+    attention_cte  forward, no sequence packing : 0.1694  (direct GA measurement)
+    attention_cte  forward, WITH sequence packing: 0.2332  (direct measurement)
+    attention_bwd           , no sequence packing : 0.2596  (see note)
+    attention_bwd           , WITH bound_min/bound_max : 0.2848  (direct GA measurement)
+
+Sequence packing costs ~+38% on the FORWARD path too, not only on backward: the
+per-tile `range_select` bound masking is emitted for every causally-live tile.
+Measured 0.2291 at seqlen 8192 and 0.2332 at 16384 (bs*nheads=2, d=80, seg 2048);
+0.2332 is used as the conservative value. Using the unpacked 0.1694 for a packed
+forward understates the body by ~35%, which is the dangerous direction.
+
+Note on the bwd/no-packing constant: measured directly as 0.2417 on Beta 5's pre-GA
+compiler (2.27.2878). GA bodies are ~8% larger, so it is scaled here by the
+GA/Beta5 packing-pair ratio (0.2848/0.2596 == 0.2645/0.2417 == 1.0969) to keep all
+three constants on the same GA basis. Mixing a GA forward constant with Beta 5
+backward constants understates the backward body by ~7.7% -- which, given the
+observed 0.967-pass / 1.058-fail boundary, is enough to matter.
+
+Sequence packing costs ~+10% because the bound handling is emitted per tile.
+NOTE these are ~8% larger than the same constants measured on PyTorch Native
+Beta 5's pre-GA compiler (2.27.2878) -- use the GA values, or you will understate
+the body and land on the cliff edge.
+
+Measured pass/fail boundary, expressed on the GA basis:
+    0.858 x 2^32 -> COMPILES   GA-measured   (fwd, bs*nheads=16, seqlen 36864)
+    1.038 x 2^32 -> COMPILES   Beta5-measured, GA behaviour UNVERIFIED
+                               (bwd, bs*nheads=1 @ 131072 and bs*nheads=4 @ 65536)
+    1.139 x 2^32 -> FAILS      GA-measured   (bwd+packing, bs*nheads=4, seqlen 65536)
+
+The largest estimate ever observed to COMPILE is 1.038 and the smallest observed to
+FAIL is 1.139, so the true ceiling on the GA basis lies in (1.038, 1.139]. There is
+no GA measurement in between.
+
+Two thresholds rather than one, because a false ASSERT would reject a shape that
+actually works -- worse than a late failure. ASSERT is therefore set ABOVE the
+largest observed pass (1.038) and below the smallest observed failure (1.139):
+
+  * >= _BODY_SIZE_ASSERT_FACTOR : hard assert. Above the highest estimate that has
+    ever been observed to compile, so this is a genuine reject.
+  * >= _BODY_SIZE_WARN_FACTOR   : warn only. Inside the uncertainty band; the shape
+    may compile, but it is near the cliff and the estimate carries +/-2.7% fit
+    error plus compiler-version drift (GA bodies are ~8% larger than Beta 5's).
+"""
+_COLZ_BODY_LIMIT_BYTES = 2**32
+_BODY_BYTES_PER_HEAD_SQ_SK_FWD = 0.1694
+_BODY_BYTES_PER_HEAD_SQ_SK_FWD_PACKED = 0.2332
+_BODY_BYTES_PER_HEAD_SQ_SK_BWD = 0.2596
+_BODY_BYTES_PER_HEAD_SQ_SK_BWD_PACKED = 0.2848
+_BODY_SIZE_ASSERT_FACTOR = 1.10  # above every observed pass, below every observed fail
+_BODY_SIZE_WARN_FACTOR = 0.85  # >= this: inside the uncertainty band -> warn
+# Kept for callers sizing a chunk: aim comfortably under the cliff, well below
+# the uncertainty band, since a chunk count is cheap to increase.
+_BODY_SIZE_SAFETY_FACTOR = 0.80
+
+
+# Bound-based tile pruning (compile-time skipping of fully-masked tiles under
+# sequence packing) emits a single memset where the dense path emits an MM1 matmul
+# chain plus exp, so it shrinks the emitted body as well as the MAC count. Measured
+# on a pruning-enabled build: ~32% smaller body at both seqlen 8192 and 16384
+# (C_eff 0.2291 -> 0.1557 and 0.2332 -> 0.1586), i.e. a roughly CONSTANT factor --
+# unlike the MAC saving, which grows with the dead fraction. Note a dead tile still
+# costs ~1 instruction, which is why the body saving saturates.
+#
+# Detected rather than assumed, so this module works unmodified on builds with and
+# without pruning.
+_BODY_PRUNE_FACTOR = 0.68
+
+
+def _pruning_available():
+    """True when this build can skip fully-masked tiles at trace time."""
+    return "_has_any_compute_bounds" in globals()
+
+
+def estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward=False, is_sequence_packed=False):
+    """Estimate the emitted kernel body size in bytes.
+
+    `bs` here is the batch dim the kernel actually sees, i.e. batch * heads when
+    heads are folded into the batch dimension.
+
+    When sequence packing is active AND this build supports bound-based tile pruning,
+    the estimate is scaled by `_BODY_PRUNE_FACTOR`, because the pruned build emits a
+    materially smaller body for the same shape. Without this the guard is ~1.5x
+    pessimistic on a pruning build and would reject shapes it can actually compile.
+    """
+    if is_backward:
+        c = (
+            _BODY_BYTES_PER_HEAD_SQ_SK_BWD_PACKED
+            if is_sequence_packed
+            else _BODY_BYTES_PER_HEAD_SQ_SK_BWD
+        )
+    else:
+        c = (
+            _BODY_BYTES_PER_HEAD_SQ_SK_FWD_PACKED
+            if is_sequence_packed
+            else _BODY_BYTES_PER_HEAD_SQ_SK_FWD
+        )
+    est = c * float(bs) * float(seqlen_q) * float(seqlen_k)
+    if is_sequence_packed and _pruning_available():
+        est *= _BODY_PRUNE_FACTOR
+    return est
+
+
+def max_seqlen_for_body_limit(bs, seqlen_k, is_backward=False, is_sequence_packed=False):
+    """Largest seqlen_q that fits the body limit for the given shape.
+
+    Use to size a query-chunked call: chunk the query axis to at most this.
+    """
+    per_q = estimate_body_bytes(bs, 1, seqlen_k, is_backward, is_sequence_packed)
+    if per_q <= 0:
+        return seqlen_k
+    return int((_BODY_SIZE_SAFETY_FACTOR * _COLZ_BODY_LIMIT_BYTES) / per_q)
+
+
+# Configurations whose body constant we MEASURED. Outside these, the estimate is an
+# extrapolation and the guard downgrades to warn-only: the measured spread across
+# configs we did test is 1.83x (0.1557..0.2848), so extrapolating and then hard-failing
+# risks rejecting a shape that compiles. Widen this only with a measurement.
+_BODY_MEASURED_HEAD_DIMS = (80, 128)
+
+
+def _estimate_is_calibrated(head_dim, causal, softmax_dtype_is_fp32):
+    """True when the body constant was fitted for a config like this one."""
+    return (
+        head_dim in _BODY_MEASURED_HEAD_DIMS
+        and not causal
+        and softmax_dtype_is_fp32
+    )
+
+
+def check_body_size(bs, seqlen_q, seqlen_k, kernel_name, is_backward=False,
+                    is_sequence_packed=False, calibrated=True):
+    """Fail EARLY and actionably if the shape cannot be compiled.
+
+    Without this the user waits tens of minutes and tens of GiB of host RAM per
+    rank before the compiler emits an opaque `colz` error that names neither the
+    cause nor the fix. Assert in milliseconds instead, and say what to change.
+
+    Two thresholds (see the constants above): warn inside the measured uncertainty
+    band, assert only above the largest estimate ever observed to compile. This
+    ordering matters -- a false assert would break a working configuration.
+    """
+    est = estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward, is_sequence_packed)
+    ratio = est / _COLZ_BODY_LIMIT_BYTES
+    if ratio < _BODY_SIZE_WARN_FACTOR:
+        return
+    # Outside the measured envelope the number is an extrapolation -- report it, never
+    # block on it.
+    if not calibrated:
+        logger.warn(
+            f"{kernel_name}: estimated kernel body {est / 2**30:.2f} GiB is {ratio:.2f}x "
+            f"the ~4 GiB colz body limit for {bs=} (batch*heads), {seqlen_q=}, "
+            f"{seqlen_k=}. This shape is OUTSIDE the configurations the estimate was "
+            f"calibrated on (head_dim in {_BODY_MEASURED_HEAD_DIMS}, non-causal, fp32 "
+            f"softmax), so treat it as indicative only. If compilation fails with "
+            f"'colz: body blob exceeds uint32 offset range', chunk the query axis or "
+            f"reduce batch*heads per call.",
+        )
+        return
+
+    max_sq = max_seqlen_for_body_limit(bs, seqlen_k, is_backward, is_sequence_packed)
+    per_call = max(estimate_body_bytes(1, seqlen_q, seqlen_k, is_backward, is_sequence_packed), 1.0)
+    max_bs = int((_BODY_SIZE_SAFETY_FACTOR * _COLZ_BODY_LIMIT_BYTES) / per_call)
+    n_chunks = max(1, -(-seqlen_q // max(max_sq, 1)))
+    # A single batch*head can already exceed the budget at this seqlen; in that case
+    # reducing batch*heads cannot help and only chunking will.
+    bs_advice = (
+        f"reduce batch*heads to <= {max_bs}"
+        if max_bs >= 1
+        else "reducing batch*heads alone cannot fix this at these sequence lengths"
+    )
+
+    if ratio < _BODY_SIZE_ASSERT_FACTOR:
+        logger.warn(
+            f"{kernel_name}: estimated kernel body {est / 2**30:.2f} GiB is "
+            f"{ratio:.2f}x the hard ~4 GiB colz limit budget and is NEAR THE CLIFF "
+            f"for {bs=} (batch*heads), {seqlen_q=}, {seqlen_k=}, "
+            f"backward={is_backward}, sequence_packed={is_sequence_packed}. "
+            f"Shapes in this band have been observed to compile, but the estimate "
+            f"carries fit error and compiler-version drift. If compilation fails with "
+            f"'colz: body blob exceeds uint32 offset range', chunk the query axis to "
+            f"seqlen_q <= {max_sq} ({n_chunks} calls), or {bs_advice}.",
+        )
+        return
+
+    kernel_assert(
+        False,
+        f"{kernel_name}: estimated kernel body {est / 2**30:.2f} GiB exceeds the hard "
+        f"~4 GiB colz limit ({ratio:.2f}x) for "
+        f"{bs=} (batch*heads), {seqlen_q=}, {seqlen_k=}, "
+        f"backward={is_backward}, sequence_packed={is_sequence_packed}. "
+        f"Compilation WILL fail with 'colz: body blob exceeds uint32 offset range'. "
+        f"The body grows as batch*heads * seqlen_q * seqlen_k. Fix by either: "
+        f"(1) chunking the query axis to seqlen_q <= {max_sq} and calling the kernel "
+        f"{n_chunks}x (exact -- each query row's softmax is "
+        f"independent; accumulate dK/dV in fp32 across chunks for the backward), or "
+        f"(2) {bs_advice} (e.g. raise the sequence-parallel degree).",
+    )
+
 
 """
 Sharding, tile size and threshold related constants
@@ -843,6 +1061,26 @@ def _attention_cte(
         logger.warn(
             f"attention_cte kernel is not tested for batch size x seqlen_q x seqlen_k above {_MAX_BS_TIMES_SEQLEN_QK}, got {bs_seqlen_qk_product=}.",
         )
+
+    # HARD body-size precondition. The warning above is about the *tested* range;
+    # this is about what can be COMPILED AT ALL. Assert early rather than letting
+    # the user burn tens of minutes and tens of GiB per rank to reach an opaque
+    # `colz: body blob exceeds uint32 offset range` from the backend.
+    check_body_size(
+        bs=bs,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k_total,
+        kernel_name="attention_cte",
+        is_backward=False,
+        is_sequence_packed=is_sequence_packed,
+        calibrated=_estimate_is_calibrated(
+            head_dim=d,
+            causal=bool(causal_mask),
+            softmax_dtype_is_fp32=(softmax_dtype == nl.float32),
+        )
+        and not sliding_window
+        and sink is None,
+    )
     if sliding_window > _MAX_SEQLEN:
         logger.warn(
             f"attention_cte kernel is not tested for sliding window above {_MAX_SEQLEN}, got {sliding_window=}.",
