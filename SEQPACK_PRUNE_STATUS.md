@@ -110,6 +110,25 @@ it.**
 `test_attention_cte_seqpack_prune.py`: **36 passed, 0 xfailed**, including device
 output-neutrality across LNC=1 and LNC=2 and five multi-section configs.
 
+## Remaining headroom: MM2/PV is NOT pruned (tracked as Task 016)
+
+**This implementation does not eliminate all the identified waste.** Forward prunes MM1 + exp; MM2
+(PV) still runs on known-zero probability blocks. Against the a-priori tile ceiling with both
+matmuls pruned:
+
+| seqlen | achieved | ceiling | captured |
+|---|---|---|---|
+| 8192 | 1.77x | 8.00x | **50%** |
+| 16384 | 3.53x | 16.00x | 76% |
+| 32768 | 7.07x | 32.00x | 89% |
+| 65536 | 14.14x | 64.00x | 94% |
+
+**Largest opportunity is at SHORT sequences** — the inverse of where the current win is biggest.
+
+**The backward pass does NOT have this gap.** It prunes whole `(q_group, k_tile)` core calls via the
+pre-existing `if any_tile_required:` gate, so dQ/dK/dV are skipped together: measured MAC 1.94x
+against a 2.00x whole-core-call ceiling at seqlen 2048 = 2x1024, i.e. **~97% captured**.
+
 ## Why MM2 is deliberately NOT pruned
 
 The kernel's SBUF/PSUM buffers are ring/modulo-allocated for the 2-deep software pipeline:
