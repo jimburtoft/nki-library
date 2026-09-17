@@ -581,7 +581,14 @@ def _attention_cte(
             is_sequence_packed,
             "segment_cu_seqlens requires bound_min/bound_max (it describes the same layout)",
         )
-        _cu = [int(x) for x in segment_cu_seqlens]
+        # NOTE: no list comprehensions or generator expressions anywhere in this file's traced
+        # paths -- the NKI HOP tracer (wrap_nki / torch.compile(backend="neuron")) rejects them
+        # with "error: unsupported expression". Verified on Beta 5: the pristine kernel traces
+        # fine and comprehensions were the only reason the patched one did not. Plain loops are
+        # equivalent here since this is all trace-time Python.
+        _cu = []
+        for _x in segment_cu_seqlens:
+            _cu.append(int(_x))
         kernel_assert(len(_cu) >= 2, "segment_cu_seqlens must have at least 2 entries")
         kernel_assert(_cu[0] == 0, "segment_cu_seqlens must start at 0")
         for _i in range(len(_cu) - 1):
@@ -589,7 +596,9 @@ def _attention_cte(
                 _cu[_i + 1] > _cu[_i],
                 "segment_cu_seqlens must be strictly increasing",
             )
-        segment_spans = [(_cu[_i], _cu[_i + 1]) for _i in range(len(_cu) - 1)]
+        segment_spans = []
+        for _i in range(len(_cu) - 1):
+            segment_spans.append((_cu[_i], _cu[_i + 1]))
 
     # Validate kv_used_len: dynamic active-KV upper bound. Restricted to the
     # non-APC, non-SWA, non-CP, non-sequence-packed, non-causal path. Shape
@@ -4102,9 +4111,9 @@ def _has_any_compute_bounds(q_grp: int, k_start_pos: int, k_tile_size: int, ac: 
         return True
     # Local coordinates: the layout is block-diagonal, so the tile is live iff some segment owns a
     # query row in this group AND overlaps the tile's key range.
-    for seg_start, seg_end in _segment_spans_local(ac):
-        if seg_start < q_end and q_start < seg_end:
-            if seg_start < k_end and k_start_pos < seg_end:
+    for _seg in _segment_spans_local(ac):
+        if _seg[0] < q_end and q_start < _seg[1]:
+            if _seg[0] < k_end and k_start_pos < _seg[1]:
                 return True
     return False
 
@@ -4135,7 +4144,10 @@ def _segment_spans_local(ac: AttnConfig):
     if not ac.cp_striped_input:
         return ac.segment_spans
     d = ac.global_cp_deg
-    return [(seg_start // d, seg_end // d) for seg_start, seg_end in ac.segment_spans]
+    out = []
+    for _seg in ac.segment_spans:
+        out.append((_seg[0] // d, _seg[1] // d))
+    return out
 
 
 def _striped_prune_is_safe(ac: AttnConfig):
@@ -4157,9 +4169,10 @@ def _striped_prune_is_safe(ac: AttnConfig):
         return False
     if d <= 1:
         return True
-    return all(
-        seg_start % d == 0 and seg_end % d == 0 for seg_start, seg_end in ac.segment_spans
-    )
+    for _seg in ac.segment_spans:
+        if _seg[0] % d != 0 or _seg[1] % d != 0:
+            return False
+    return True
 
 
 def _is_first_live_section(q_grp: int, ac: AttnConfig, atp: AttnTileParams, sp: SectionParams):
@@ -4255,9 +4268,9 @@ def _has_any_compute_bounds_section(q_grp: int, ac: AttnConfig, atp: AttnTilePar
     q_end = min(q_start + _Q_GRP_SZ * num_grps, ac.seqlen_q)
     if q_end <= q_start:
         return False
-    for seg_start, seg_end in _segment_spans_local(ac):
-        if seg_start < q_end and q_start < seg_end:
-            if seg_start < k_end and k_start < seg_end:
+    for _seg in _segment_spans_local(ac):
+        if _seg[0] < q_end and q_start < _seg[1]:
+            if _seg[0] < k_end and k_start < _seg[1]:
                 return True
     return False
 
