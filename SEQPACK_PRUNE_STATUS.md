@@ -379,6 +379,27 @@ Task 009's other three mitigations do not touch anything here:
 | lowering-stampede pre-lock | framework `nki_kernel.py` | no |
 | query chunking | caller / trainer | no |
 
+## ⚠ NKI HOP tracer constraints (learned the hard way, 2026-09-12)
+
+The prune originally worked under a direct `compile_to_bir` invocation but **failed under
+`wrap_nki` / `torch.compile(backend="neuron")`** -- the PyTorch Native path a customer actually
+uses. Two tracer restrictions, both surfacing as unhelpful errors:
+
+| construct | error | fix |
+|---|---|---|
+| list comprehension / generator (`[f(x) for x in xs]`, `all(...)`) | `error: unsupported expression` | plain `for` loop with `.append()` |
+| tuple unpacking in a `for` target (`for a, b in pairs:`) | `error: expecting simple variable` | `for _p in pairs:` then index `_p[0]`, `_p[1]` |
+
+Both are **trace-time Python only**, so the rewrite costs nothing at runtime. Verified on Beta 5:
+the pristine kernel traces fine through `wrap_nki`, and these constructs were the only reason the
+patched one did not -- i.e. this was a defect in the patch, not a platform limitation.
+
+**Validated after the fix** (Beta 5 container, `wrap_nki(attention_cte)[2]`, seqlen 1024 / 4x256
+packed, non-causal): baseline and pruned both run and are **bit-identical, max|delta| = 0.000e+00**.
+
+**If you add code to this kernel, test it through `wrap_nki`, not only through `compile_to_bir`.**
+The direct path is more permissive and will silently accept code the supported path rejects.
+
 ## Reproduce
 
 ```bash
