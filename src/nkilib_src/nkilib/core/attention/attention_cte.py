@@ -199,6 +199,15 @@ Measured 0.2291 at seqlen 8192 and 0.2332 at 16384 (bs*nheads=2, d=80, seg 2048)
 0.2332 is used as the conservative value. Using the unpacked 0.1694 for a packed
 forward understates the body by ~35%, which is the dangerous direction.
 
+CALIBRATION BASE: these constants are fitted on the PUBLIC kernel
+(aws-neuron/nki-library @ 92d11f6). A fork whose emission differs will need its own
+fit -- measured on jimburtoft/nki-library @ 6960a0b the packed-forward constant is
+0.1562, i.e. this value is ~49% HIGH there. Overstating is the safe direction for a
+guard (it warns early, it never waves a bad shape through), but it is large enough to
+risk a false assert, which is why the calibration gate is conservative about what it
+will block. Re-fit with scripts/task010_body_size_effect.py if you port this to a
+build with materially different forward emission.
+
 Note on the bwd/no-packing constant: measured directly as 0.2417 on Beta 5's pre-GA
 compiler (2.27.2878). GA bodies are ~8% larger, so it is scaled here by the
 GA/Beta5 packing-pair ratio (0.2848/0.2596 == 0.2645/0.2417 == 1.0969) to keep all
@@ -243,23 +252,40 @@ _BODY_SIZE_WARN_FACTOR = 0.85  # >= this: inside the uncertainty band -> warn
 _BODY_SIZE_SAFETY_FACTOR = 0.80
 
 
-# Bound-based tile pruning (compile-time skipping of fully-masked tiles under
-# sequence packing) emits a single memset where the dense path emits an MM1 matmul
-# chain plus exp, so it shrinks the emitted body as well as the MAC count. This applies
-# to the FORWARD kernel only -- attention_bwd has no bound pruning on any build shipped
-# to date. Measured
-# on a pruning-enabled build: ~32% smaller body at both seqlen 8192 and 16384
-# (C_eff 0.2291 -> 0.1557 and 0.2332 -> 0.1586), i.e. a roughly CONSTANT factor --
-# unlike the MAC saving, which grows with the dead fraction. Note a dead tile still
-# costs ~1 instruction, which is why the body saving saturates.
+# Bound-based tile pruning (compile-time skipping of fully-masked tiles under sequence
+# packing) emits a single memset where the dense path emits an MM1 matmul chain plus exp,
+# so it shrinks the emitted body as well as the MAC count. Present in BOTH attention_cte
+# and attention_bwd.
 #
-# Detected rather than assumed, so this module works unmodified on builds with and
-# without pruning.
-_BODY_PRUNE_FACTOR = 0.68
+# IMPORTANT: pruning is enabled only when the caller passes the compile-time descriptor
+# (`segment_cu_seqlens`, or `segment_len` for a uniform layout). Passing
+# bound_min/bound_max ALONE does not prune -- `_has_any_compute_bounds` returns True
+# whenever `ac.segment_spans is None`. The factors below are therefore the best case,
+# realized only when the descriptor is supplied.
+#
+# Measured on the prune build with the descriptor passed, seg 2048, d=128:
+#     fwd  S= 8192: 20,966,984 -> 16,788,984 body bytes  = 1.25x  (C 0.1562 -> 0.1251)
+#     bwd  S= 8192: 17,921,431 ->  4,775,329             = 3.75x  (C 0.2671 -> 0.0712)
+#     bwd  S=16384: 71,406,281 ->  9,919,973             = 7.20x  (C 0.2660 -> 0.0370)
+#
+# Two separate factors, because the two kernels behave very differently:
+#   * FORWARD saturates at ~1.25x. A dead tile still costs ~1 instruction (the memset),
+#     and forward keeps MM2/PV unpruned, so the saving is roughly constant in seqlen.
+#   * BACKWARD grows with seqlen (3.75x at 8192, 7.20x at 16384) because a much larger
+#     share of its body is prunable. The conservative (smallest measured) value is used,
+#     so the estimate stays pessimistic at longer sequences rather than optimistic.
+_BODY_PRUNE_FACTOR_FWD = 0.81  # 0.1251/0.1562=0.801; rounded UP to stay conservative
+_BODY_PRUNE_FACTOR_BWD = 0.27  # 0.0712/0.2671=0.267 at S=8192; 0.139 at 16384 -> use the LARGER
 
 
 def _pruning_available():
-    """True when this build can skip fully-masked tiles at trace time."""
+    """True when this build can skip fully-masked tiles at trace time.
+
+    NOTE this reports only that the BUILD supports pruning. Whether a given call
+    actually prunes additionally requires the caller to pass `segment_cu_seqlens` (or
+    `segment_len`); without it the kernel takes the dense path. The estimate assumes the
+    descriptor is passed, which is the intended usage for a packed workload.
+    """
     return "_has_any_compute_bounds" in globals()
 
 
@@ -287,13 +313,8 @@ def estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward=False, is_sequence_p
             else _BODY_BYTES_PER_HEAD_SQ_SK_FWD
         )
     est = c * float(bs) * float(seqlen_q) * float(seqlen_k)
-    # FORWARD ONLY. Bound-based pruning is implemented in attention_cte; attention_bwd
-    # has no pruning at all on any build shipped to date -- it does not even accept the
-    # segment descriptor -- so applying the factor there would understate the backward
-    # body by ~32%. Backward is the binding constraint for training, so that error would
-    # be in the dangerous direction. Revisit if/when backward pruning lands.
-    if is_sequence_packed and not is_backward and _pruning_available():
-        est *= _BODY_PRUNE_FACTOR
+    if is_sequence_packed and _pruning_available():
+        est *= _BODY_PRUNE_FACTOR_BWD if is_backward else _BODY_PRUNE_FACTOR_FWD
     return est
 
 
