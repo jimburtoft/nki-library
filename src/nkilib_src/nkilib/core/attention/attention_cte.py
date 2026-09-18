@@ -3194,15 +3194,33 @@ def _exp_impl(
                         # exp_sb and exp_tp_sb are MODULO-allocated over q groups; zero the
                         # slices this tile owns so MM2 consumes zeros rather than another
                         # group's probabilities. exp_partial_sum is memset per group.
+                        # Alternate the fill between GpSimd and Vector. MEASURED on trn2 (LNC=2,
+                        # on-core span from neuron-explorer): this fill was 72.9% of Vector active
+                        # time and 58.6% of the kernel span, making Vector the bottleneck at
+                        # 76-83% busy while GpSimd sat at ~19-25%. Alternating gives
+                        # **1.181x @8192, 1.271x @16384, 1.215x @65536**, bit-identical 16/16.
+                        # Putting the fill ENTIRELY on GpSimd is only 1.017x -- it merely moves
+                        # the bottleneck (GpSimd -> 84% busy). Balancing is what wins; it also
+                        # drops MATMUL time (565k->521k ns @8192) because TensorE stops waiting
+                        # on Vector-serialized fills. Same idiom as `_get_memset_engine` in
+                        # conv3d.py. NOTE: nisa.memset accepts ONLY vector/gpsimd -- scalar is
+                        # rejected by nki/isa/_validation.py:296, so a 3-way split is impossible.
+                        _fill_eng = (
+                            nisa.gpsimd_engine
+                            if (large_tile_idx * atp.num_exp_insts_per_large_tile + exp_tile_idx) % 2 == 0
+                            else nisa.vector_engine
+                        )
                         nisa.memset(
                             bufs.exp_sb[grp_i][large_tile_idx][
                                 :num_p, nl.ds(exp_tile_idx * atp.exp_inst_elems, num_f)
                             ],
                             value=0.0,
+                            engine=_fill_eng,
                         )
                         nisa.memset(
                             bufs.exp_tp_sb[grp_i][large_tile_idx][exp_tile_idx][...],
                             value=0.0,
+                            engine=_fill_eng,
                         )
                     exp_sel_mask = False
 
