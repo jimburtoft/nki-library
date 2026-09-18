@@ -302,10 +302,22 @@ def max_seqlen_for_body_limit(bs, seqlen_k, is_backward=False, is_sequence_packe
 
 
 # Configurations whose body constant we MEASURED. Outside these, the estimate is an
-# extrapolation and the guard downgrades to warn-only: the measured spread across
-# configs we did test is 1.83x (0.1557..0.2848), so extrapolating and then hard-failing
-# risks rejecting a shape that compiles. Widen this only with a measurement.
-_BODY_MEASURED_HEAD_DIMS = (80, 128)
+# extrapolation and the guard downgrades to warn-only, because the measured spread
+# across configurations is large enough (1.83x, 0.1557..0.2848) that extrapolating and
+# then hard-failing risks rejecting a shape that compiles. Widen only with a measurement.
+#
+# Measured, packed forward, seqlen 8192, batch*heads 2, seg 2048, on the dense build:
+#     head_dim  64  -> 0.2291
+#     head_dim  80  -> 0.2291
+#     head_dim 128  -> 0.2291     <- head_dim does NOT affect C in this range
+#     head_dim 256  -> 0.2678     <- +17%, so 256 stays OUT (we would UNDERSTATE)
+#     causal, d=128 -> 0.1325     <- 42% LOWER, so causal stays OUT (see below)
+#
+# Causal is excluded for the OPPOSITE reason to head_dim 256: causal already skips
+# roughly half its tiles, so the dense constant OVERSTATES a causal body by ~1.73x. A
+# causal shape whose true size is at the limit would be estimated at 1.73x and falsely
+# asserted. Warn-only there is the correct behavior until a causal constant is fitted.
+_BODY_MEASURED_HEAD_DIMS = (64, 80, 128)
 
 
 def _estimate_is_calibrated(head_dim, causal, softmax_dtype_is_fp32):
