@@ -245,7 +245,9 @@ _BODY_SIZE_SAFETY_FACTOR = 0.80
 
 # Bound-based tile pruning (compile-time skipping of fully-masked tiles under
 # sequence packing) emits a single memset where the dense path emits an MM1 matmul
-# chain plus exp, so it shrinks the emitted body as well as the MAC count. Measured
+# chain plus exp, so it shrinks the emitted body as well as the MAC count. This applies
+# to the FORWARD kernel only -- attention_bwd has no bound pruning on any build shipped
+# to date. Measured
 # on a pruning-enabled build: ~32% smaller body at both seqlen 8192 and 16384
 # (C_eff 0.2291 -> 0.1557 and 0.2332 -> 0.1586), i.e. a roughly CONSTANT factor --
 # unlike the MAC saving, which grows with the dead fraction. Note a dead tile still
@@ -285,7 +287,12 @@ def estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward=False, is_sequence_p
             else _BODY_BYTES_PER_HEAD_SQ_SK_FWD
         )
     est = c * float(bs) * float(seqlen_q) * float(seqlen_k)
-    if is_sequence_packed and _pruning_available():
+    # FORWARD ONLY. Bound-based pruning is implemented in attention_cte; attention_bwd
+    # has no pruning at all on any build shipped to date -- it does not even accept the
+    # segment descriptor -- so applying the factor there would understate the backward
+    # body by ~32%. Backward is the binding constraint for training, so that error would
+    # be in the dangerous direction. Revisit if/when backward pruning lands.
+    if is_sequence_packed and not is_backward and _pruning_available():
         est *= _BODY_PRUNE_FACTOR
     return est
 
