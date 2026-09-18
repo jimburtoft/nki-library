@@ -110,6 +110,51 @@ it.**
 `test_attention_cte_seqpack_prune.py`: **36 passed, 0 xfailed**, including device
 output-neutrality across LNC=1 and LNC=2 and five multi-section configs.
 
+## MEASURED: the safety fill was the bottleneck, and balancing it across two engines gives +1.18-1.27x
+
+**This supersedes the "forward is exhausted" section below**, which was based on compiler `est_util`
+rather than a profile. A real neuron-explorer profile found that the largest single Vector cost in the
+pruned kernel was **the zero-fill the pruning itself introduced** -- 72.9% of Vector active time and
+58.6% of the kernel span.
+
+**Fix (shipped): alternate the fill between GpSimd and Vector by tile index.** On-core span, trn2,
+LNC=2, seg=1024, non-causal:
+
+| seqlen | control | alternating | gain | Vector busy | GpSimd busy |
+|---|---|---|---|---|---|
+| 8192 | 381,146 ns | 322,661 ns | **1.181x** | 76.1% -> 64.6% | 25.1% -> 61.9% |
+| 16384 | 727,599 ns | 572,521 ns | **1.271x** | 80.5% -> 72.0% | 18.9% -> 60.3% |
+| 65536 | 2,782,985 ns | 2,290,430 ns | **1.215x** | 82.7% -> 70.8% | 20.0% -> 59.4% |
+
+**Validation: 16/16 bit-identical, 0 errors** through `wrap_nki` -- identical to the control on the same
+matrix (11 forward incl. multi-section 8192/16384, striped CP g32768/g65536 D4, unaligned, causal,
+single-segment control; 5 backward at cos 1.000000000 vs the autograd oracle).
+
+MATMUL time also drops (565k -> 521k ns @8192) because TensorE stops waiting on Vector-serialized fills.
+
+### Alternatives measured and rejected
+
+| approach | result | why |
+|---|---|---|
+| all memset on GpSimd | 1.017x | **moves** the bottleneck (GpSimd -> 84% busy) instead of balancing it |
+| all memset on Scalar | **cannot compile** | `nisa.memset` accepts only vector/gpsimd (`nki/isa/_validation.py:296`) |
+| narrow the filled slice to what MM2 reads | **0.900x REGRESSION** | 1,092 -> 3,896 instructions; issue overhead dominates, bytes were never the cost |
+| hoist the fill out of the exp-tile loop | **NaN** | puts the fill AFTER the `dma_transpose` that consumes `exp_sb` -- clobbers live data. Looked like 1.537x on wall-clock; caught by bit-identity |
+| bf16 instead of fp32 | N/A | `exp_tp_sb` is already bf16 (`:2380`) |
+
+### Methodology warning
+
+**Wall-clock through `wrap_nki` is inadmissible for a change this size.** Two sweeps of identical
+variants inverted the ranking (this variant measured 1.600x, then 0.929x; the GpSimd-only variant
+0.888x, then 1.245x). Per-variant stdev was 12-15% and the reference baseline drifted 0.717-0.829 ms
+*between processes*. A device sync inside the timed region is necessary but **not** sufficient -- it
+fixes async undercounting, not host dispatch-overhead noise. Use the on-core span.
+
+When reading the `Instruction` parquet: subtract `evt_wait_time_ns + dma_wait_time_ns` from
+`duration_ns`; divide by the pcore count (LNC=2 -> 2); and treat `Tensor`/`TensorMatrix` as separate
+pipelined tracks (use merged intervals per engine per pcore). Skipping any of these yields
+>100%-of-span nonsense.
+
 ## FORWARD IS EXHAUSTED -- read this before attempting further forward optimization
 
 Both remaining forward avenues were investigated on 2026-09-17 and both are closed.
