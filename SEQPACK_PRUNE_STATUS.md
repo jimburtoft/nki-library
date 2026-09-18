@@ -110,6 +110,38 @@ it.**
 `test_attention_cte_seqpack_prune.py`: **36 passed, 0 xfailed**, including device
 output-neutrality across LNC=1 and LNC=2 and five multi-section configs.
 
+## FORWARD IS EXHAUSTED -- read this before attempting further forward optimization
+
+Both remaining forward avenues were investigated on 2026-09-17 and both are closed.
+
+**1. MM2/PV pruning (Task 016) is worth ~1.00x above 16K.** MM2 is Tensor work, but after MM1+exp
+pruning the kernel is **Vector-bound**: Tensor drops to 41-44% while Vector sits at 99-100%. Freeing
+*all* remaining Tensor work is worth at most 1.01x at 8192 and ~1.00x at 16384+.
+
+**2. The "realization gap" (MAC ratio / wall-clock = 1.16-1.32x) is not recoverable.** It is not idle
+time -- Vector idle is 1.1% at 8192, 0.4% at 16384. Wall-clock equals *Vector work removed x packing
+gain*, not the MAC ratio (8192: 1.23x x 1.09x = 1.33x). And pruned Vector work already scales
+**linearly** in seqlen (1.99x for 2x) versus the baseline's quadratic 4.43x.
+
+**Every mechanism one would propose is already implemented in this repo:**
+
+| idea | already handled | where |
+|---|---|---|
+| hoist the 26-cyc/elt `Reciprocal` | it is one element per partition, negligible | `attention_cte.py:3424` |
+| offload Vector work to the idle ACT/Scalar engine | exp already on ACT, sum **fused** (`activation_reduce`) | `attention_cte.py:3211` |
+| split a reduction DVE + ACT | already in production | `attention_tkg.py:3366` |
+| dodge the DualMemSpace 2x | `range_select` reads PSUM **directly** | `swa_fused_cte.py:1829` |
+
+The residual Vector time **is** `nisa.range_select`, which fuses the mask, the PSUM->SBUF read, and the
+row-max reduce into one instruction, and was deliberately chosen over `affine_select` ("the #1 GpSimd
+cost"). There is no cheap win hiding there.
+
+**Caveat**: the above is static reading plus compiler `est_util`, which is explicitly *not* a wall-time
+model. If forward latency ever becomes the binding constraint, profile with `neuron-explorer` first.
+
+**Note also that for training, backward dominates attention time** -- forward is already at 5.95x
+(32K) and 12.15x (64K). Optimizing forward further is unlikely to move end-to-end training time.
+
 ## Remaining headroom: MM2/PV is NOT pruned (tracked as Task 016)
 
 **This implementation does not eliminate all the identified waste.** Forward prunes MM1 + exp; MM2
