@@ -1,5 +1,17 @@
 # Sequence-packing tile pruning -- status
 
+> **All performance numbers in this document are measured on hardware.** The canonical index --
+> every published number, the artifact backing it, and the method used -- lives outside this repo at
+> `working/zyphra_troubleshooting/docs/MEASUREMENTS.md`. If a number appears here but not there,
+> treat it as an estimate.
+>
+> Two rules that repeatedly changed conclusions on this work:
+> 1. **Never quote a MAC/tile ratio as a speedup.** They differ by 1.16-1.32x here, and an
+>    incorrect kernel once looked 3.8-14.3x "better" on MACs at cos 0.158.
+> 2. **Below ~1.2x, wall-clock through `wrap_nki` is inadmissible** (12-15% stdev; two sweeps
+>    inverted the ranking). Use the on-core span from `neuron-explorer`.
+
+
 **Correct and hardware-validated, including multi-section (seqlen > 8192) and striped CP.**
 
 > ## ⚠ APPLICABILITY LIMIT: ONE NEFF PER PACKING LAYOUT
