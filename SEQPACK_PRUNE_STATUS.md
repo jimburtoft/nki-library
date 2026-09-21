@@ -1,9 +1,8 @@
 # Sequence-packing tile pruning -- status
 
 > **All performance numbers in this document are measured on hardware.** The canonical index --
-> every published number, the artifact backing it, and the method used -- lives outside this repo at
-> `working/zyphra_troubleshooting/docs/MEASUREMENTS.md`. If a number appears here but not there,
-> treat it as an estimate.
+> every published number, the artifact backing it, and the method used -- is maintained outside this
+> repository. If a number appears here but not there, treat it as an estimate.
 >
 > Two rules that repeatedly changed conclusions on this work:
 > 1. **Never quote a MAC/tile ratio as a speedup.** They differ by 1.16-1.32x here, and an
