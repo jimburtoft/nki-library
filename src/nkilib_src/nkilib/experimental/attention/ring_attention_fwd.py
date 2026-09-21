@@ -878,6 +878,7 @@ def ring_attention_spmd_fwd(
     tp_k: bool = False,
     bound_min: nl.NkiTensor = None,
     bound_max: nl.NkiTensor = None,
+    segment_cu_seqlens: tuple = None,
 ):
     """
     Ring attention forward using attention_cte with HBM I/O.
@@ -991,8 +992,42 @@ def ring_attention_spmd_fwd(
         is_sequence_packed == (bound_max != None),
         "bound_min and bound_max must both be provided or both be None",
     )
+    # Guard the one combination the core cannot serve, at the wrapper, with a readable message.
+    #
+    # PRE-EXISTING UPSTREAM INCONSISTENCY (not introduced here, verified against pristine
+    # 92d11f6): striped_input=True with a NON-causal, NON-packed call yields
+    # global_cp_deg=None while cp_striped_input=True is still forwarded, so attention_cte
+    # rejects it deep inside with "cp_striped_input requires CP mode (global_cp_deg must be
+    # set)". The BACKWARD wrapper already guards this at ring_attention_bwd.py:119
+    # ("striped_attention requires use_causal_mask"); the forward only mentioned it in a
+    # docstring (:919) and let it fail in the core. Assert it here so fwd and bwd agree and
+    # the diagnostic names the caller's mistake rather than an internal invariant.
+    #
+    # Striping is meaningful when SOMETHING supplies a mask -- causal, or sequence packing.
+    # With neither, a striped layout has no meaning, which is why the combination is rejected
+    # rather than supported.
+    if striped_input:
+        kernel_assert(
+            use_causal_mask or is_sequence_packed,
+            "striped_input requires use_causal_mask=True or sequence packing "
+            "(bound_min/bound_max), which supplies its own mask",
+        )
+
     if is_sequence_packed:
-        kernel_assert(use_causal_mask, "bound_min/bound_max require use_causal_mask=True")
+        # Non-causal (bidirectional) sequence packing is supported: the bounds ARE the mask.
+        #
+        # Why causal was required before: on the causal path the kernel must reconcile the
+        # causal term against the CP layout, which needs cp_offset. Sequence packing supplies
+        # its own per-query bounds, so on a NON-causal packed call there is no causal term to
+        # reconcile -- the bounds alone define which keys each query may see. The core kernel
+        # accepts this (attention_cte relaxes its two CP causal asserts for
+        # ac.is_sequence_packed).
+        #
+        # striped_input is still required in BOTH cases, and for the same reason: the bound
+        # tensors are expressed in LOCAL K coordinates (global // cp_degree) and are only
+        # identical across ranks under the striped layout with every document boundary
+        # divisible by cp_degree. See cu_seqlens_to_striped_bounds(). A contiguous-CP packed
+        # call would need per-rank bounds, which this interface does not carry.
         kernel_assert(striped_input, "bound_min/bound_max require striped_input=True")
 
     if replica_groups == None:
@@ -1022,10 +1057,23 @@ def ring_attention_spmd_fwd(
             buffer=nl.shared_hbm,
         )
 
+    # True when this call will enter attention_cte's CP mode: the causal path always does,
+    # and a non-causal SEQUENCE-PACKED call now does too (it must pass global_cp_deg so the
+    # core sizes the striped layout). Everything CP-conditional below keys off this rather
+    # than off use_causal_mask.
+    _needs_cp_params = use_causal_mask or is_sequence_packed
+
     softmax_scale = softmax_scale or (1.0 / float(d**0.5))
-    # When using causal mask with CP mode, attention_cte requires scale=1.0.
-    # The caller must pre-scale Q by softmax_scale before invoking this kernel.
-    attn_scale = 1.0 if use_causal_mask else softmax_scale
+    # attention_cte requires scale=1.0 on ANY CP path -- not just the causal one
+    # (attention_cte.py: "SWA/Prefix Caching/CP/kv_used_len only support scale=1.0", because
+    # those paths use range-select instead of TSCR). The caller must pre-scale Q by
+    # softmax_scale before invoking this kernel.
+    #
+    # This was previously keyed on use_causal_mask alone, which was correct only because CP
+    # was reachable only via the causal path. Now that non-causal packed calls also enter CP
+    # (they must pass global_cp_deg to size the striped layout), the condition has to follow
+    # CP, not causality -- otherwise the raw softmax_scale reaches the core and it asserts.
+    attn_scale = 1.0 if _needs_cp_params else softmax_scale
 
     """
     LNC info — needed for _normalize_and_write_output to write only this
@@ -1092,6 +1140,16 @@ def ring_attention_spmd_fwd(
 
     # For causal masking, rank IDs are needed to compute cp_offset per ring step.
     # cp_offset_hbm is a (1,1) shared HBM tensor that gets updated each ring step.
+    #
+    # NON-CAUSAL PACKED: the kernel still needs global_cp_deg (to size the striped layout) and
+    # therefore a non-null cp_offset -- attention_cte asserts "cp_offset missing but
+    # global_cp_deg is provided" (:1813). But the VALUE is never consumed on this path: with
+    # is_sequence_packed and not is_causal, the core skips the cp_offset bound adjustment
+    # entirely, because range_sel_ubs is a constant sentinel (seqlen_k_active) rather than a
+    # per-row causal position, and the real bound is bound_max applied by the following min().
+    # So we allocate it and memset it to 0 ONCE, and never recompute it per ring step. That is
+    # also why the per-ring-step rank-id machinery below stays causal-only: it exists purely to
+    # derive a causal cp_offset, which does not exist here.
     cp_offset_hbm = None
     if use_causal_mask:
         iota_nw_sb = nl.ndarray((1, num_workers), dtype=nl.float32, buffer=nl.sbuf)
@@ -1108,8 +1166,12 @@ def ring_attention_spmd_fwd(
 
     allocator = ModularAllocator(initial_address=0)
 
-    # Ring step 0: Local K/V (Q and K from same rank => cp_offset=0)
-    if use_causal_mask:
+    # Ring step 0: Local K/V (Q and K from same rank => cp_offset=0).
+    # The non-causal packed path also lands here: it needs a valid (zero) cp_offset tensor
+    # once, and never updates it again (see the note at the allocation above).
+    if _needs_cp_params:
+        if cp_offset_hbm is None:
+            cp_offset_hbm = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         _cp_zero_sb = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(_cp_zero_sb, 0.0)
         nisa.dma_copy(dst=cp_offset_hbm, src=_cp_zero_sb)
@@ -1130,12 +1192,16 @@ def ring_attention_spmd_fwd(
         tp_k=tp_k,
         tp_out=False,
         cache_softmax=True,
-        cp_offset=cp_offset_hbm if use_causal_mask else None,
-        global_cp_deg=num_workers if use_causal_mask else None,
+        # Pass the CP params on the causal path AND on the non-causal packed path. The
+        # non-causal packed case needs global_cp_deg so the core sizes the striped layout
+        # correctly; its cp_offset is a constant zero that the core never consumes.
+        cp_offset=cp_offset_hbm if _needs_cp_params else None,
+        global_cp_deg=num_workers if _needs_cp_params else None,
         cp_striped_input=striped_input,
         skip_output_normalization=True,
         bound_min=bound_min,
         bound_max=bound_max,
+        segment_cu_seqlens=segment_cu_seqlens,
     )
 
     # Initialize send KV buffers with local K/V.
@@ -1195,12 +1261,13 @@ def ring_attention_spmd_fwd(
             tp_k=tp_k,
             tp_out=False,
             cache_softmax=True,
-            cp_offset=cp_offset_hbm if use_causal_mask else None,
-            global_cp_deg=num_workers if use_causal_mask else None,
+            cp_offset=cp_offset_hbm if _needs_cp_params else None,
+            global_cp_deg=num_workers if _needs_cp_params else None,
             cp_striped_input=striped_input,
             skip_output_normalization=True,
             bound_min=bound_min,
             bound_max=bound_max,
+            segment_cu_seqlens=segment_cu_seqlens,
         )
 
         """
