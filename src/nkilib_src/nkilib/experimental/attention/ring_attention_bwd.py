@@ -49,6 +49,7 @@ def ring_attention_spmd_bwd(
     striped_attention: bool = False,
     bound_min: nl.ndarray = None,
     bound_max: nl.ndarray = None,
+    segment_cu_seqlens: tuple = None,
 ):
     """
     Ring Attention Backward SPMD kernel.
@@ -116,7 +117,15 @@ def ring_attention_spmd_bwd(
         return dQ, dK, dV
     """
     if striped_attention:
-        kernel_assert(use_causal_mask, "striped_attention requires use_causal_mask")
+        # Striped layout is meaningful without causality when sequence packing supplies the
+        # mask: the stripe determines WHICH global rows this rank owns, independent of whether
+        # the mask is causal. Only the non-packed non-causal case is genuinely nonsensical
+        # (striping with no mask at all), so that combination stays rejected.
+        kernel_assert(
+            use_causal_mask or (bound_min is not None),
+            "striped_attention requires use_causal_mask (or sequence packing, which carries "
+            "its own mask)",
+        )
     bs, nh, dh, sl = q_ref.shape
     kernel_assert(sl % 128 == 0, f"seqlen must be divisible by 128, got {sl}")
 
@@ -130,7 +139,16 @@ def ring_attention_spmd_bwd(
         "bound_min and bound_max must both be provided or both be None",
     )
     if is_sequence_packed:
-        kernel_assert(use_causal_mask, "bound_min/bound_max require use_causal_mask=True")
+        # Non-causal (bidirectional) sequence packing is supported: the bounds ARE the mask.
+        # On the causal path bound_max must be clamped per ring step against the moving causal
+        # frontier (iota + 1 - no_diag), which is why cp_offset/rank machinery is needed there.
+        # A non-causal packed call has no causal frontier -- bound_min/bound_max alone define
+        # the visible key range, and they are ring-step-INDEPENDENT, so no clamp and no rank
+        # bookkeeping is required at all.
+        #
+        # striped_attention stays required: the bounds are in LOCAL K coordinates
+        # (global // cp_degree) and are only identical across ranks under the striped layout
+        # with every doc boundary divisible by cp_degree (see cu_seqlens_to_striped_bounds).
         kernel_assert(striped_attention, "bound_min/bound_max require striped_attention=True")
 
     if replica_groups is None:
@@ -229,6 +247,7 @@ def ring_attention_spmd_bwd(
             ss=softmax_scale,
             bound_min=bound_min,
             bound_max=bound_max,
+            segment_cu_seqlens=segment_cu_seqlens,
         )
 
     return out_dq, out_dk, out_dv
@@ -416,6 +435,7 @@ def _compute_step(
     striped=False,
     bound_min_sbuf=None,
     bound_max_sbuf=None,
+    segment_spans=None,
 ):
     """
     Run backward core for all Q tiles against all local K tiles.
@@ -492,6 +512,13 @@ def _compute_step(
                 k_tile_idx,
                 k_seq_tile_size,
                 0,
+                # KEYWORD, not positional: the 9th positional slot is cp_offset, not
+                # segment_spans. Passing it positionally put the span list into cp_offset and
+                # broke the CAUSAL path with "'add' expected ... got (int, NoneType)" at
+                # attention_bwd.py:908 (`... + cp_offset`). Our non-causal path happened to
+                # still work because that line is inside `if use_causal_mask:` -- a good
+                # reminder that "my variant passes" is not evidence the change is safe.
+                segment_spans=segment_spans,
             )
             if any_r:
                 kl, vl = [], []
@@ -574,6 +601,7 @@ def _ring_bwd_impl(
     ss=None,
     bound_min=None,
     bound_max=None,
+    segment_cu_seqlens=None,
 ):
     """
     Inner implementation for one (batch, head) pair of ring attention backward.
@@ -632,6 +660,19 @@ def _ring_bwd_impl(
     # non-ring (min(bound_max, iota+1+cp_offset)) is re-done per ring step here
     # because cp_offset (encoded via no_diag) changes with my_rank vs recv_rank.
     is_seq_packed = bound_min is not None
+
+    # Compile-time packed layout for per-tile pruning. The descriptor arrives in GLOBAL
+    # coordinates (same convention as attention_cte's segment_cu_seqlens); the tile predicate
+    # in get_required_tiles_mask compares against LOCAL tile offsets, so scale by the CP degree.
+    # Under striped CP with every doc boundary a multiple of nw, the local layout is identical on
+    # every rank, so one conversion serves all ring steps -- same reasoning as the bounds tensors.
+    # No list comprehension / tuple unpacking: the NKI HOP tracer rejects both (Task 015).
+    segment_spans_local = None
+    if is_seq_packed and segment_cu_seqlens is not None:
+        segment_spans_local = []
+        _cu = tuple(segment_cu_seqlens)
+        for _i in range(len(_cu) - 1):
+            segment_spans_local.append((_cu[_i] // nw, _cu[_i + 1] // nw))
 
     cfg = setup_config(
         q_ref,
@@ -787,7 +828,11 @@ def _ring_bwd_impl(
     # striped causal rule). At step 0, my_rank == recv_rank => no_diag = 0 =>
     # causal_ub_exclusive = iota + 1, matching attention_bwd's non-ring packing path.
     step0_bound_max_sbuf = None
-    if causal and is_seq_packed:
+    if is_seq_packed and not causal:
+        # Non-causal packed: bound_max needs NO causal clamp and is ring-step-independent,
+        # so pass the loaded bounds straight through, unchanged, at every step.
+        step0_bound_max_sbuf = bound_max_sb
+    elif causal and is_seq_packed:
         step0_bound_max_sbuf = _build_bound_max_clamped(
             qts,
             qnt,
@@ -826,6 +871,7 @@ def _ring_bwd_impl(
         striped=striped,
         bound_min_sbuf=bound_min_sb if is_seq_packed else None,
         bound_max_sbuf=step0_bound_max_sbuf,
+        segment_spans=segment_spans_local,
     )
 
     # Copy dQ step0 into send_dq
@@ -873,7 +919,11 @@ def _ring_bwd_impl(
 
         rs_bounds = None
         step_bound_max_sbuf = None
-        if causal:
+        if is_seq_packed and not causal:
+            # Same as step 0: no causal frontier to track, so the unclamped bounds are
+            # correct at every ring step and no rank-id machinery is needed.
+            step_bound_max_sbuf = bound_max_sb
+        elif causal:
             recv_rank_sb = _load_rank_sb(iota_nw, recv_rank, qts)
 
             if striped:
@@ -945,6 +995,7 @@ def _ring_bwd_impl(
             striped=striped,
             bound_min_sbuf=bound_min_sb if is_seq_packed else None,
             bound_max_sbuf=step_bound_max_sbuf,
+            segment_spans=segment_spans_local,
         )
 
         # dQ reduction: combine local dq_s with incoming cur_dq_recv, write to cur_dq_send
