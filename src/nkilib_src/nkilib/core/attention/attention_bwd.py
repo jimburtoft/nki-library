@@ -177,6 +177,7 @@ def attention_bwd(
         use_causal_mask,
         sliding_window,
         cp_offset,
+        segment_cu_seqlens,
     )
 
     # Softmax scaling factor, applied to QK scores in exp
@@ -333,6 +334,15 @@ def validate_inputs(
         kernel_name="attention_bwd",
         is_backward=True,
         is_sequence_packed=bound_min is not None,
+        # Largest packed span. With tile pruning the backward body scales with this,
+        # not with seqlen_k, so passing it is what keeps the estimate from being
+        # several-fold pessimistic at long sequence.
+        segment_len=(
+            max(segment_cu_seqlens[_i + 1] - segment_cu_seqlens[_i]
+                for _i in range(len(segment_cu_seqlens) - 1))
+            if segment_cu_seqlens and len(segment_cu_seqlens) > 1
+            else None
+        ),
     )
 
 

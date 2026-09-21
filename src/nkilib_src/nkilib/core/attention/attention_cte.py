@@ -252,30 +252,37 @@ _BODY_SIZE_WARN_FACTOR = 0.85  # >= this: inside the uncertainty band -> warn
 _BODY_SIZE_SAFETY_FACTOR = 0.80
 
 
-# Bound-based tile pruning (compile-time skipping of fully-masked tiles under sequence
-# packing) emits a single memset where the dense path emits an MM1 matmul chain plus exp,
-# so it shrinks the emitted body as well as the MAC count. Present in BOTH attention_cte
-# and attention_bwd.
+# Bound-based tile pruning changes the SHAPE of the cost model, not just its scale.
 #
-# IMPORTANT: pruning is enabled only when the caller passes the compile-time descriptor
-# (`segment_cu_seqlens`, or `segment_len` for a uniform layout). Passing
-# bound_min/bound_max ALONE does not prune -- `_has_any_compute_bounds` returns True
-# whenever `ac.segment_spans is None`. The factors below are therefore the best case,
-# realized only when the descriptor is supplied.
+# Dense: every Q group attends every K tile, so the body is QUADRATIC in sequence
+# length -- body ~ C * (batch*heads) * seqlen_q * seqlen_k.
 #
-# Measured on the prune build with the descriptor passed, seg 2048, d=128:
-#     fwd  S= 8192: 20,966,984 -> 16,788,984 body bytes  = 1.25x  (C 0.1562 -> 0.1251)
-#     bwd  S= 8192: 17,921,431 ->  4,775,329             = 3.75x  (C 0.2671 -> 0.0712)
-#     bwd  S=16384: 71,406,281 ->  9,919,973             = 7.20x  (C 0.2660 -> 0.0370)
+# Pruned (sequence packing, with the compile-time descriptor supplied): each Q group
+# attends only its own segment, so the live tile count per Q group depends on the
+# SEGMENT length, not on total sequence length. The body becomes LINEAR in seqlen:
 #
-# Two separate factors, because the two kernels behave very differently:
-#   * FORWARD saturates at ~1.25x. A dead tile still costs ~1 instruction (the memset),
-#     and forward keeps MM2/PV unpruned, so the saving is roughly constant in seqlen.
-#   * BACKWARD grows with seqlen (3.75x at 8192, 7.20x at 16384) because a much larger
-#     share of its body is prunable. The conservative (smallest measured) value is used,
-#     so the estimate stays pessimistic at longer sequences rather than optimistic.
-_BODY_PRUNE_FACTOR_FWD = 0.81  # 0.1251/0.1562=0.801; rounded UP to stay conservative
-_BODY_PRUNE_FACTOR_BWD = 0.27  # 0.0712/0.2671=0.267 at S=8192; 0.139 at 16384 -> use the LARGER
+#     body ~ C_prune * (batch*heads) * seqlen_q * segment_len
+#
+# Measured on the pruning build with the descriptor passed (d=128, bf16, non-causal),
+# backward, segment_len 2048:
+#     seqlen  8192 ->  4,775,329 B   body/seqlen = 583
+#     seqlen 16384 ->  9,919,973 B   body/seqlen = 606
+#     seqlen 32768 -> 21,355,767 B   body/seqlen = 652
+# body/seqlen is near-constant across a 4x range, i.e. linear. Forward is also reduced
+# but far less (~1.25x at seqlen 8192) because a dead tile still costs one memset and
+# MM2/PV remain unpruned, so forward keeps the quadratic form with a flat factor.
+#
+# Applying a flat discount to the quadratic model instead of switching to the linear one
+# over-estimates badly at long sequence: 2.3x at seqlen 262144 and 4.6x at 524288. That
+# would ASSERT on shapes which compile fine -- the exact false reject the two-threshold
+# design exists to prevent -- so the backward path uses the linear model whenever the
+# segment length is known.
+_BODY_PRUNE_FACTOR_FWD = 0.81  # forward stays quadratic; measured 0.1251/0.1562 = 0.801
+# body/seqlen is 583 / 606 / 652 across seqlen 8192 / 16384 / 32768 -- it drifts UP
+# slightly, so the constant is taken from the LARGEST measured fit (652/2048) rather
+# than the middle one. Using the middle value left the estimate 7% optimistic at
+# seqlen 32768, and under-estimating is the dangerous direction for a precondition.
+_BODY_BYTES_PER_HEAD_SQ_SEGL_BWD = 0.3184
 
 
 def _pruning_available():
@@ -289,7 +296,8 @@ def _pruning_available():
     return "_has_any_compute_bounds" in globals()
 
 
-def estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward=False, is_sequence_packed=False):
+def estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward=False, is_sequence_packed=False,
+                        segment_len=None):
     """Estimate the emitted kernel body size in bytes.
 
     `bs` here is the batch dim the kernel actually sees, i.e. batch * heads when
@@ -312,18 +320,30 @@ def estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward=False, is_sequence_p
             if is_sequence_packed
             else _BODY_BYTES_PER_HEAD_SQ_SK_FWD
         )
-    est = c * float(bs) * float(seqlen_q) * float(seqlen_k)
     if is_sequence_packed and _pruning_available():
-        est *= _BODY_PRUNE_FACTOR_BWD if is_backward else _BODY_PRUNE_FACTOR_FWD
-    return est
+        if is_backward and segment_len:
+            # Linear model: pruning makes the backward body scale with the segment
+            # length, not with seqlen_k. Cap at the dense estimate so a segment_len
+            # larger than seqlen_k can never inflate the answer.
+            linear = (_BODY_BYTES_PER_HEAD_SQ_SEGL_BWD * float(bs) * float(seqlen_q)
+                      * float(min(segment_len, seqlen_k)))
+            return min(linear, c * float(bs) * float(seqlen_q) * float(seqlen_k))
+        if not is_backward:
+            return (c * float(bs) * float(seqlen_q) * float(seqlen_k)
+                    * _BODY_PRUNE_FACTOR_FWD)
+        # Backward on a pruning build but segment_len unknown: fall through to the
+        # dense estimate. Over-estimating only costs a warning, and the caller gets a
+        # message telling it to pass the descriptor.
+    return c * float(bs) * float(seqlen_q) * float(seqlen_k)
 
 
-def max_seqlen_for_body_limit(bs, seqlen_k, is_backward=False, is_sequence_packed=False):
+def max_seqlen_for_body_limit(bs, seqlen_k, is_backward=False, is_sequence_packed=False,
+                              segment_len=None):
     """Largest seqlen_q that fits the body limit for the given shape.
 
     Use to size a query-chunked call: chunk the query axis to at most this.
     """
-    per_q = estimate_body_bytes(bs, 1, seqlen_k, is_backward, is_sequence_packed)
+    per_q = estimate_body_bytes(bs, 1, seqlen_k, is_backward, is_sequence_packed, segment_len)
     if per_q <= 0:
         return seqlen_k
     return int((_BODY_SIZE_SAFETY_FACTOR * _COLZ_BODY_LIMIT_BYTES) / per_q)
@@ -358,7 +378,7 @@ def _estimate_is_calibrated(head_dim, causal, softmax_dtype_is_fp32):
 
 
 def check_body_size(bs, seqlen_q, seqlen_k, kernel_name, is_backward=False,
-                    is_sequence_packed=False, calibrated=True):
+                    is_sequence_packed=False, calibrated=True, segment_len=None):
     """Fail EARLY and actionably if the shape cannot be compiled.
 
     Without this the user waits tens of minutes and tens of GiB of host RAM per
@@ -369,7 +389,8 @@ def check_body_size(bs, seqlen_q, seqlen_k, kernel_name, is_backward=False,
     band, assert only above the largest estimate ever observed to compile. This
     ordering matters -- a false assert would break a working configuration.
     """
-    est = estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward, is_sequence_packed)
+    est = estimate_body_bytes(bs, seqlen_q, seqlen_k, is_backward, is_sequence_packed,
+                              segment_len)
     ratio = est / _COLZ_BODY_LIMIT_BYTES
     if ratio < _BODY_SIZE_WARN_FACTOR:
         return
@@ -387,8 +408,10 @@ def check_body_size(bs, seqlen_q, seqlen_k, kernel_name, is_backward=False,
         )
         return
 
-    max_sq = max_seqlen_for_body_limit(bs, seqlen_k, is_backward, is_sequence_packed)
-    per_call = max(estimate_body_bytes(1, seqlen_q, seqlen_k, is_backward, is_sequence_packed), 1.0)
+    max_sq = max_seqlen_for_body_limit(bs, seqlen_k, is_backward, is_sequence_packed,
+                                       segment_len)
+    per_call = max(estimate_body_bytes(1, seqlen_q, seqlen_k, is_backward,
+                                       is_sequence_packed, segment_len), 1.0)
     max_bs = int((_BODY_SIZE_SAFETY_FACTOR * _COLZ_BODY_LIMIT_BYTES) / per_call)
     n_chunks = max(1, -(-seqlen_q // max(max_sq, 1)))
     # A single batch*head can already exceed the budget at this seqlen; in that case
@@ -1120,6 +1143,8 @@ def _attention_cte(
         )
         and not sliding_window
         and sink is None,
+        # Largest packed span: what the pruned body actually scales with.
+        segment_len=(max((e - b) for b, e in segment_spans) if segment_spans else None),
     )
     if sliding_window > _MAX_SEQLEN:
         logger.warn(
