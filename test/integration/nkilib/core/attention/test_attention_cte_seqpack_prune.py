@@ -200,8 +200,7 @@ SEQPACK_PRUNE_CASES = [
 
 # MULTI-SECTION configurations (seqlen > 8192, so more than one flash section).
 #
-# These are the lengths that actually matter for the customer: their ViT targets 128K via
-# context parallelism, so the relevant shapes are the PER-RANK lengths. They are also where the
+# These are the PER-RANK lengths of a 128K sequence under context parallelism. They are also where the
 # payoff is largest -- waste grows with sequence length, since the dense grid is O(seqlen^2)
 # while useful work is only O(seqlen * segment).
 #
