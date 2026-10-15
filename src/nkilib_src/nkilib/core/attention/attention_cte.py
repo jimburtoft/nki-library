@@ -208,21 +208,21 @@ risk a false assert, which is why the calibration gate is conservative about wha
 will block. Re-fit with scripts/task010_body_size_effect.py if you port this to a
 build with materially different forward emission.
 
-Note on the bwd/no-packing constant: measured directly as 0.2417 on Beta 5's pre-GA
-compiler (2.27.2878). GA bodies are ~8% larger, so it is scaled here by the
-GA/Beta5 packing-pair ratio (0.2848/0.2596 == 0.2645/0.2417 == 1.0969) to keep all
-three constants on the same GA basis. Mixing a GA forward constant with Beta 5
+Note on the bwd/no-packing constant: measured directly as 0.2417 on a pre-GA
+compiler (neuronx-cc 2.27.2878). GA bodies are ~8% larger, so it is scaled here by the
+GA/pre-GA packing-pair ratio (0.2848/0.2596 == 0.2645/0.2417 == 1.0969) to keep all
+three constants on the same GA basis. Mixing a GA forward constant with pre-GA
 backward constants understates the backward body by ~7.7% -- which, given the
 observed 0.967-pass / 1.058-fail boundary, is enough to matter.
 
 Sequence packing costs ~+10% because the bound handling is emitted per tile.
-NOTE these are ~8% larger than the same constants measured on PyTorch Native
-Beta 5's pre-GA compiler (2.27.2878) -- use the GA values, or you will understate
+NOTE these are ~8% larger than the same constants measured on the
+pre-GA compiler (neuronx-cc 2.27.2878) -- use the GA values, or you will understate
 the body and land on the cliff edge.
 
 Measured pass/fail boundary, expressed on the GA basis:
     0.858 x 2^32 -> COMPILES   GA-measured   (fwd, bs*nheads=16, seqlen 36864)
-    1.038 x 2^32 -> COMPILES   Beta5-measured, GA behaviour UNVERIFIED
+    1.038 x 2^32 -> COMPILES   pre-GA-measured, GA behaviour UNVERIFIED
                                (bwd, bs*nheads=1 @ 131072 and bs*nheads=4 @ 65536)
     1.139 x 2^32 -> FAILS      GA-measured   (bwd+packing, bs*nheads=4, seqlen 65536)
 
@@ -238,7 +238,7 @@ largest observed pass (1.038) and below the smallest observed failure (1.139):
     ever been observed to compile, so this is a genuine reject.
   * >= _BODY_SIZE_WARN_FACTOR   : warn only. Inside the uncertainty band; the shape
     may compile, but it is near the cliff and the estimate carries +/-2.7% fit
-    error plus compiler-version drift (GA bodies are ~8% larger than Beta 5's).
+    error plus compiler-version drift (GA bodies are ~8% larger than pre-GA).
 """
 _COLZ_BODY_LIMIT_BYTES = 2**32
 _BODY_BYTES_PER_HEAD_SQ_SK_FWD = 0.1694
@@ -920,7 +920,7 @@ def _attention_cte(
         )
         # NOTE: no list comprehensions or generator expressions anywhere in this file's traced
         # paths -- the NKI HOP tracer (wrap_nki / torch.compile(backend="neuron")) rejects them
-        # with "error: unsupported expression". Verified on Beta 5: the pristine kernel traces
+        # with "error: unsupported expression". Verified with torch.compile(backend="neuron"): the pristine kernel traces
         # fine and comprehensions were the only reason the patched one did not. Plain loops are
         # equivalent here since this is all trace-time Python.
         _cu = []
