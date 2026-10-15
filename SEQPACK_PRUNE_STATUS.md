@@ -102,8 +102,8 @@ Hardware-verified on trn2.3xlarge (DLAMI 20260818 / SDK 2.32, neuronx-cc 2.27.53
 | 4096 unaligned [1500,1300,796,500] | 1.41x | **1.19x** | 85% | yes |
 | 4096 single segment (control) | 1.00x | 1.00x | - | yes |
 
-**Multi-section (this is where it matters -- the customer targets 128K via context parallelism,
-so per-rank lengths are the relevant shapes):**
+**Multi-section (this is where it matters -- a 128K sequence under context parallelism has
+these per-rank lengths):**
 
 | Config | sections | MAC ratio | **wall-clock** | bit-identical |
 |---|---|---|---|---|
@@ -115,8 +115,8 @@ so per-rank lengths are the relevant shapes):**
 Realized efficiency (wall-clock / MAC ratio) *improves* with length: 76%, 83%, 84%, 86%.
 
 Savings grow with sequence length, as expected: the dense grid is O(seqlen^2) while useful work
-is only O(seqlen x segment). **The optimization is most valuable exactly where the customer needs
-it.**
+is only O(seqlen x segment). **The optimization is most valuable at long
+sequence lengths.**
 
 `test_attention_cte_seqpack_prune.py`: **36 passed, 0 xfailed**, including device
 output-neutrality across LNC=1 and LNC=2 and five multi-section configs.
@@ -377,7 +377,7 @@ This matters because it removes a restriction I had previously reported as struc
 parameter-level gate, not an architectural limit -- non-packed non-causal CP remains rejected, as it
 should be, since it genuinely has no mask to fall back on.
 
-**Still blocked upstream for the customer's exact workload**: the ring wrappers assert
+**Still blocked upstream for non-causal packed ring CP**: the ring wrappers assert
 `bound_min/bound_max require use_causal_mask=True` (`ring_attention_fwd.py:995`,
 `ring_attention_bwd.py:133`). A non-causal packed ViT under ring CP therefore cannot pass bounds
 through the wrapper today, independent of anything in this file.
@@ -489,19 +489,19 @@ Task 009's other three mitigations do not touch anything here:
 ## ⚠ NKI HOP tracer constraints (learned the hard way, 2026-09-12)
 
 The prune originally worked under a direct `compile_to_bir` invocation but **failed under
-`wrap_nki` / `torch.compile(backend="neuron")`** -- the PyTorch Native path a customer actually
-uses. Two tracer restrictions, both surfacing as unhelpful errors:
+`wrap_nki` / `torch.compile(backend="neuron")`** -- the PyTorch Native path users actually
+run. Two tracer restrictions, both surfacing as unhelpful errors:
 
 | construct | error | fix |
 |---|---|---|
 | list comprehension / generator (`[f(x) for x in xs]`, `all(...)`) | `error: unsupported expression` | plain `for` loop with `.append()` |
 | tuple unpacking in a `for` target (`for a, b in pairs:`) | `error: expecting simple variable` | `for _p in pairs:` then index `_p[0]`, `_p[1]` |
 
-Both are **trace-time Python only**, so the rewrite costs nothing at runtime. Verified on Beta 5:
+Both are **trace-time Python only**, so the rewrite costs nothing at runtime. Verified with `torch.compile(backend="neuron")`:
 the pristine kernel traces fine through `wrap_nki`, and these constructs were the only reason the
 patched one did not -- i.e. this was a defect in the patch, not a platform limitation.
 
-**Validated after the fix** (Beta 5 container, `wrap_nki(attention_cte)[2]`, seqlen 1024 / 4x256
+**Validated after the fix** (PyTorch Native container, `wrap_nki(attention_cte)[2]`, seqlen 1024 / 4x256
 packed, non-causal): baseline and pruned both run and are **bit-identical, max|delta| = 0.000e+00**.
 
 **If you add code to this kernel, test it through `wrap_nki`, not only through `compile_to_bir`.**
@@ -509,7 +509,7 @@ The direct path is more permissive and will silently accept code the supported p
 
 ## Backward pass (`attention_bwd`) — validated and measured
 
-Same `segment_cu_seqlens` parameter, threaded into `get_required_tiles_mask`. Validated on Beta 5
+Same `segment_cu_seqlens` parameter, threaded into `get_required_tiles_mask`. Validated
 via `wrap_nki(attention_bwd)[lnc]`, gating both baselines against the autograd-verified
 `attention_bwd_torch_ref` before reporting any prune result:
 

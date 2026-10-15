@@ -639,7 +639,7 @@ def _attention_cte(
         )
         # NOTE: no list comprehensions or generator expressions anywhere in this file's traced
         # paths -- the NKI HOP tracer (wrap_nki / torch.compile(backend="neuron")) rejects them
-        # with "error: unsupported expression". Verified on Beta 5: the pristine kernel traces
+        # with "error: unsupported expression". Verified with torch.compile(backend="neuron"): the pristine kernel traces
         # fine and comprehensions were the only reason the patched one did not. Plain loops are
         # equivalent here since this is all trace-time Python.
         _cu = []
