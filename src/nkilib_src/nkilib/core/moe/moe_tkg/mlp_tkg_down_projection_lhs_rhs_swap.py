@@ -81,6 +81,8 @@ def down_projection_lhs_rhs_swap(
     )
 
     # Allocate PSUM buffers
+    # Gate/up occupy PSUM banks 0 and 1 when packed; start down at bank 2.
+    _psum_base = 2 if (num_required_down_psum_banks + 2 <= dims._psum_bmax and div_ceil(dims.I, dims.I0) * T <= dims._psum_fmax) else 0
     result_psums = []
     for psum_idx in range(num_required_down_psum_banks):
         result_psum = nl.ndarray(
@@ -88,7 +90,7 @@ def down_projection_lhs_rhs_swap(
             dtype=nl.float32,
             name=f"down_psum_{sbm.get_name_prefix()}_{psum_idx}",
             buffer=nl.psum,
-            address=None if sbm.is_auto_alloc() else (0, psum_idx * dims._psum_fmax * 4),
+            address=None if sbm.is_auto_alloc() else (0, (psum_idx + _psum_base) * dims._psum_fmax * 4),
         )
         result_psums.append(result_psum)
 
@@ -113,7 +115,7 @@ def down_projection_lhs_rhs_swap(
             nisa.dma_copy(
                 dst=weight_sb_tile_slice,
                 src=weight_hbm_tile_slice.slice(dim=0, start=i_tile.start_offset, end=i_tile.end_offset),
-                dge_mode=nisa.dge_mode.hwdge if use_dge else adaptive_dge_mode(weight),
+                dge_mode=nisa.dge_mode.hwdge, engine=(nisa.engine.scalar if T >= 8 else nisa.engine.unknown),  # hwdge; Scalar queue for T >= 8
             )
 
             """

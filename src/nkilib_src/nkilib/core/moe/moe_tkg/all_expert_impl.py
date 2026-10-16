@@ -46,6 +46,9 @@ from .moe_tkg_utils import (
 )
 from .projection_utils import input_norm_load, transpose_store
 
+# Gate/up weights may be passed gate/up-major as [E, 2, H, I] (detected by shape[1] == 2).
+SUPPORTS_GATE_UP_MAJOR = True
+
 
 @dataclass
 class TokenTilingConfig(nl.NKIObject):
@@ -774,8 +777,10 @@ def _select_expert_params(
     expert_down_w = down_proj_weights.select(dim=0, index=expertIdx)
 
     if len(expert_gate_w.shape) > 2:
-        expert_gate_w = expert_gate_w.select(dim=1, index=GateUpDim.GATE.value)
-        expert_up_w = expert_up_w.select(dim=1, index=GateUpDim.UP.value)
+        # Gate/up-major layout [E, 2, H, I] is detected by shape[1] == 2.
+        _gu_dim = 0 if gate_proj_weights.shape[1] == 2 else 1
+        expert_gate_w = expert_gate_w.select(dim=_gu_dim, index=GateUpDim.GATE.value)
+        expert_up_w = expert_up_w.select(dim=_gu_dim, index=GateUpDim.UP.value)
 
     expert_gate_b, expert_up_b, expert_down_b = None, None, None
     if gate_proj_bias != None:

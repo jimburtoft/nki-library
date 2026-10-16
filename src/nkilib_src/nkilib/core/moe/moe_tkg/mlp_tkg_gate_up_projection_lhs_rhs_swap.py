@@ -103,8 +103,19 @@ def gate_up_projection_lhs_rhs_swap(
     weight_base_idx = div_ceil(H, tiles.HTile) % num_allocated_w_tile if "up" in op_name else 0
 
     # Allocate PSUM buffers to store output
+    # Pack all I tiles of this projection into one PSUM bank (column offset i*T).
+    _packed_pack = (div_ceil(I, I0) * T <= dims._psum_fmax) and not params.use_tkg_gate_up_proj_column_tiling
+    if _packed_pack:
+        _packed_bank = 1 if is_up_proj else 0
+        _packed_psum = nl.ndarray(
+            shape=(dims._pmax, dims._psum_fmax),
+            dtype=nl.float32,
+            name=f"{op_name}_{sbm.get_name_prefix()}_psum_packed",
+            buffer=nl.psum,
+            address=None if sbm.is_auto_alloc() else (0, _packed_bank * dims._psum_fmax * 4),
+        )
     result_psums = []
-    for i_tile in TiledRange(I, I0):
+    for i_tile in TiledRange(I, I0) if not _packed_pack else []:
         psum_idx = (i_tile.index + tiles.up_psum_base_bank) % dims._psum_bmax if is_up_proj else i_tile.index
         result_psum = nl.ndarray(
             shape=(dims._pmax, dims._psum_fmax),
@@ -140,7 +151,9 @@ def gate_up_projection_lhs_rhs_swap(
         for h1_tile in TiledRange(hidden_tiles.size, H0):
             for i_tile in TiledRange(I, I0):
                 nisa.nc_matmul(
-                    result_psums[i_tile.index][0 : i_tile.size, 0:T],
+                    _packed_psum[0 : i_tile.size, nl.ds(i_tile.index * T, T)]
+                    if _packed_pack
+                    else result_psums[i_tile.index][0 : i_tile.size, 0:T],
                     weight_sb_tile_slice.select(dim=1, index=h1_tile.index).slice(
                         dim=1, start=i_tile.start_offset, end=i_tile.end_offset
                     ),
@@ -165,7 +178,9 @@ def gate_up_projection_lhs_rhs_swap(
         interleave_copy(
             index=i_tile.index,
             dst=output_tile_view,
-            src=result_psums[i_tile.index][0 : i_tile.size, 0:T],
+            src=_packed_psum[0 : i_tile.size, nl.ds(i_tile.index * T, T)]
+            if _packed_pack
+            else result_psums[i_tile.index][0 : i_tile.size, 0:T],
             scale=dequant_tile_view,
             bias=None,
         )

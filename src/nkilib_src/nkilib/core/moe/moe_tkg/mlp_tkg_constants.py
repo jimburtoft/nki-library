@@ -290,7 +290,7 @@ class MLPTKGConstants(nl.NKIObject):
             HTile = min_HTile
             w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
             num_required_w_tile = div_ceil(dims.H_per_shard, HTile)
-            num_allocated_w_tile = 2
+            num_allocated_w_tile = max(2, 2 * num_required_w_tile)  # double-buffer every gate/up weight tile
         elif share_memory_scope:
             HTile = ini_HTile
             w_tile_sz = I * (HTile // dims._pmax) * w_dtype_sz
@@ -400,7 +400,7 @@ class MLPTKGConstants(nl.NKIObject):
         if sbm.is_auto_alloc():
             return MLPTKGConstantsDownTileCounts(
                 HTile=down_HTile,
-                num_allocated_w_tile=2,
+                num_allocated_w_tile=max(2, div_ceil(dims.I, dims.I0) * div_ceil(dims.H_per_shard, down_HTile)),  # hold all down weight tiles
                 weight_base_idx=0,
             )
 

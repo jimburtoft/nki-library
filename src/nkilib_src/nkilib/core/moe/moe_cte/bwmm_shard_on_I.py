@@ -1700,6 +1700,7 @@ def load_gate_up_proj_weights_shard_intermediate(
                         indirect_dim=0,
                     ),
                     oob_mode=oob_mode.skip if cfg.skip_dma.skip_weight else oob_mode.error,
+                    dge_mode=nisa.dge_mode.hwdge,  # keep weight DMAs off the busy GpSimd queue
                 )
             else:
                 offset = load_p_offset * (2 * _I_TP) + gate_or_up * _I_TP + I_TP_offset
@@ -1712,6 +1713,7 @@ def load_gate_up_proj_weights_shard_intermediate(
                         indirect_dim=0,
                     ),
                     oob_mode=oob_mode.skip if cfg.skip_dma.skip_weight else oob_mode.error,
+                    dge_mode=nisa.dge_mode.hwdge,  # keep weight DMAs off the busy GpSimd queue
                 )
 
     return load_dst
@@ -2445,6 +2447,7 @@ def load_down_proj_weight_shard_intermediate_H_tile(
             dst=dp_load_dst[i_tile_idx][0:num_p, 0:num_f],
             src=down_proj_weight.ap(pattern=[[_H, num_p], [1, num_f]], offset=offset, scalar_offset=block_expert),
             oob_mode=oob_mode.skip if cfg.skip_dma.skip_weight else oob_mode.error,
+            dge_mode=nisa.dge_mode.hwdge,  # keep weight DMAs off the busy GpSimd queue
         )
 
     return dp_load_dst

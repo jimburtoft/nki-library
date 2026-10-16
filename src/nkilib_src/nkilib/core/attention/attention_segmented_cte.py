@@ -38,6 +38,10 @@ from .attention_cte import (
 )
 from .fused_segmented_attention import fused_segmented_attention_impl
 
+# The sliding-window sink path has no dynamic loop, so this kernel can share a graph with a
+# dynamic-loop MoE kernel (for example moe_cte shard_on_i_hybrid).
+SWA_SINK_STATIC = True
+
 
 def floor_nisa_kernel(src_t: nl.NkiTensor, dst_t: nl.NkiTensor, p_size: int, f_size: int, allocator: ModularAllocator):
     """
@@ -773,17 +777,8 @@ def _attention_segmented_cte_swa_impl(
     if sink is not None:
         sink_masked = nl.ndarray(shape=sink.shape, dtype=sink.dtype, buffer=nl.private_hbm)
         nisa.dma_copy(dst=sink_masked, src=sink)
-        no_prior_sbuf = allocator.alloc_sbuf_tensor(shape=(1, 1), dtype=nl.int32)
-        nisa.tensor_scalar(dst=no_prior_sbuf, data=effective_prior_len_sbuf, op0=nl.less_equal, operand0=0)
-        no_prior_reg = nisa.register_alloc()
-        nisa.register_load(dst=no_prior_reg, src=no_prior_sbuf)
-        sink_reload_sbuf = allocator.alloc_sbuf_tensor(shape=sink.shape, dtype=sink.dtype, align_to=4)
-        nisa.dma_copy(dst=sink_reload_sbuf, src=sink)
-
-        def _mask_sink_prior(_):
-            nisa.dma_copy(dst=sink_masked, src=sink_reload_sbuf)
-
-        nl.fori_loop(0, no_prior_reg, _mask_sink_prior)
+        # The removed dynamic loop only re-copied sink into sink_masked (a no-op). Combined with a dynamic
+        # MoE loop in the same graph it made neuronx-cc fail with NCC_IGCA024.
         sink = sink_masked
 
     # prior_block_offset = max(0, active_block_offset - num_prior_blocks_to_load) (dynamic)
