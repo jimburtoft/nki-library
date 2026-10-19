@@ -40,6 +40,9 @@ from .moe_tkg_utils import (
 )
 from .projection_utils import input_norm_load, transpose_store
 
+# Gate/up weights may be passed gate/up-major as [E, 2, H, I] (detected by shape[1] == 2).
+SUPPORTS_GATE_UP_MAJOR = True
+
 
 def _selective_expert_moe_tkg(
     params: MLPParameters,
@@ -251,12 +254,14 @@ def _selective_expert_moe_tkg(
             expert_id_scalar_offset = expert_idx.ap(
                 pattern=[[dims.K, 1], [1, 1]], offset=global_token_idx * dims.K + expert_k_idx
             )
+            # Gate/up-major layout [E, 2, H, I] is detected by shape[1] == 2.
+            _gu_dim = 0 if initial_gate_proj_weights.shape[1] == 2 else 1
             params.gate_proj_weights_tensor = initial_gate_proj_weights.select(
                 dim=0, index=expert_id_scalar_offset
-            ).select(dim=1, index=GateUpDim.GATE.value)
+            ).select(dim=_gu_dim, index=GateUpDim.GATE.value)
 
             params.up_proj_weights_tensor = initial_up_proj_weights.select(dim=0, index=expert_id_scalar_offset).select(
-                dim=1, index=GateUpDim.UP.value
+                dim=_gu_dim, index=GateUpDim.UP.value
             )
 
             params.down_proj_weights_tensor = initial_down_proj_weights.select(dim=0, index=expert_id_scalar_offset)

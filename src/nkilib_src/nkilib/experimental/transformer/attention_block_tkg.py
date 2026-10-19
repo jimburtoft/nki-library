@@ -1974,15 +1974,15 @@ def _QKV_processing(
             nisa.tensor_copy(v_all_sb, qkv_sb[:, nl.ds(d_head * (q_heads + kv_heads), kv_heads * d_head)])
             if kv_quant:
                 v_all_sb = _quantize_to_fp8(v_all_sb, v_scale, sbm, kv_quant_dtype)
-            V_hbm_flat = V_hbm.reshape((B * kv_heads * S_tkg, d_head))
-            for batch_idx in range(tile_B):
-                src_start = batch_idx * S_tkg
-                flat_dst = (tile_b_start + batch_idx) * kv_heads * S_tkg
-                for kv_head_idx in range(kv_heads):
-                    nisa.dma_copy(
-                        V_hbm_flat[nl.ds(flat_dst + kv_head_idx * S_tkg, S_tkg), :],
-                        v_all_sb[nl.ds(src_start, S_tkg), nl.ds(kv_head_idx * d_head, d_head)],
-                    )
+            # One strided DMA per KV head covering the whole batch tile
+            for kv_head_idx in range(kv_heads):
+                nisa.dma_copy(
+                    dst=V_hbm.ap(
+                        pattern=[[kv_heads * S_tkg * d_head, tile_B], [d_head, S_tkg], [1, d_head]],
+                        offset=(tile_b_start * kv_heads + kv_head_idx) * S_tkg * d_head,
+                    ),
+                    src=v_all_sb[nl.ds(0, tile_B * S_tkg), nl.ds(kv_head_idx * d_head, d_head)],
+                )
 
     # Quantize K to FP8 for attention when kv_quant=True
     if kv_quant:
