@@ -34,7 +34,7 @@ token-identical on Trn2 hardware.
 ```bash
 # Activate the vLLM 0.29 environment first (DLAMI venv or the vLLM 0.29 container).
 pip install "git+https://github.com/jimburtoft/nki-library.git@gptoss-trn2-perf-2.33"
-python -c "import nkilib.core.moe.moe_tkg.selective_expert_impl as m; print(m.SUPPORTS_GATE_UP_MAJOR)"
+python -c "from nkilib.core.moe.moe_tkg import selective_expert_impl as m; print(m.SUPPORTS_GATE_UP_MAJOR)"   # prints True
 # The vLLM-Neuron compile cache does not key on kernel source. Clear it after any kernel change:
 rm -rf ~/.cache/neuron_libtorch
 ```
