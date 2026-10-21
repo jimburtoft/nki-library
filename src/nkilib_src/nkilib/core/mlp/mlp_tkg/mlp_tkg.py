@@ -328,6 +328,14 @@ def mlp_tkg(
         params.shard_on_h_disabled = True
         T = T_shard
 
+    # --- Single-token down projection mode ---
+    # At T == 1 the LHS/RHS-swap down projection runs strided-stationary matmuls and leaves the
+    # output as [H0, H1_shard, 1], which needs a 16 B-element transposed store. Column tiling uses
+    # the [I0, 1] gate/up output column as a unit-stride stationary and yields [1, H_per_shard]
+    # for one contiguous store. The gate/up swap output [I0, I1, T] is consumed unchanged.
+    if _use_b1_down_column_tiling(params, T):
+        params.use_tkg_down_proj_column_tiling = True
+
     # --- Default path: tile along BxS and H-shard across cores ---
     tile_size = min(BS_TILE_SIZE, T)
 
@@ -407,6 +415,29 @@ def mlp_tkg(
     if mlpp_store_fused_add(params):
         output_tensors.append(output_stored_add_tensor_hbm)
     return output_tensors
+
+
+def _use_b1_down_column_tiling(params: MLPParameters, T: int) -> bool:
+    """Whether a T == 1 dense call should run the down projection in column-tiling mode."""
+    if T != 1:
+        return False
+    if params.use_tkg_down_proj_column_tiling:
+        return False
+    if params.use_tkg_gate_up_proj_column_tiling:
+        return False
+    if params.use_tkg_down_proj_optimized_layout:
+        return False
+    if params.transposed_out or params.store_output_in_sbuf:
+        return False
+    if params.quant_params.is_quant() or params.quant_params.is_dtype_mx():
+        return False
+    if params.expert_params:
+        return False
+    if len(params.down_proj_weights_tensor.shape) != 2:
+        return False
+    if nisa.get_nc_version() == nisa.nc_version.gen2:
+        return False
+    return True
 
 
 def _is_llama3_70b_specialized_config(params: MLPParameters) -> bool:

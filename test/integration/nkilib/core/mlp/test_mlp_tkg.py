@@ -1467,6 +1467,54 @@ class TestMlpTkgKernel:
             up_clamp_lower_limit=up_clamp_lower_limit,
         )
 
+    # Single-token dense calls (T == 1) with gate/up column tiling off now run the
+    # down projection in column-tiling mode (_use_b1_down_column_tiling). Cover the
+    # mixed setting at LNC 1 and 2, with and without fused add + RMSNorm, at a small
+    # sim-friendly shape and at a 2048-hidden decoder shape.
+    @pytest.mark.parametrize(
+        "vnc_degree,hidden,intermediate,fused_add",
+        [
+            pytest.param(2, 1024, 448, False, marks=pytest.mark.fast),
+            pytest.param(1, 1024, 448, False),
+            pytest.param(2, 1024, 448, True),
+            pytest.param(2, 2048, 1536, True),
+            pytest.param(1, 2048, 1536, True),
+        ],
+    )
+    def test_mlp_tkg_single_token_down_column_tiling(
+        self,
+        test_manager: Orchestrator,
+        platform_target: Platforms,
+        vnc_degree: int,
+        hidden: int,
+        intermediate: int,
+        fused_add: bool,
+    ):
+        self._run_validated_mlp_tkg(
+            test_manager=test_manager,
+            platform_target=platform_target,
+            vnc_degree=vnc_degree,
+            batch=1,
+            seqlen=1,
+            hidden=hidden,
+            intermediate=intermediate,
+            dtype=nl.bfloat16,
+            quant_dtype=None,
+            quant_type=QuantizationType.NONE,
+            norm_type=NormType.RMS_NORM if fused_add else NormType.NO_NORM,
+            fused_add=fused_add,
+            store_add=fused_add,
+            act_fn_type=ActFnType.SiLU,
+            skip_gate=False,
+            gate_bias=False,
+            up_bias=False,
+            down_bias=False,
+            norm_bias=False,
+            use_tkg_gate_up_proj_column_tiling=False,
+            use_tkg_down_proj_column_tiling=False,
+            use_tkg_down_proj_optimized_layout=False,
+        )
+
     # ============================================================================
     # TKG FP8 ROW Sweep Tests
     # ============================================================================
