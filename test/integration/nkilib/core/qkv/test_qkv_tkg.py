@@ -153,6 +153,7 @@ def qkv_tkg_sb2sb_wrapper_kernel(
     v_squared_sum_out: Optional[nl.NkiTensor] = None,  # noqa: ARG001
     # Signature parity with qkv_torch_ref; unused in wrapper (qkv_tkg is dtype-passing).
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,  # noqa: ARG001
+    output_d_major: bool = False,  # noqa: ARG001
 ) -> nl.NkiTensor:
     hidden = input
     qkv_w = fused_qkv_weights

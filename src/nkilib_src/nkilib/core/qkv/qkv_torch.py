@@ -98,6 +98,7 @@ def qkv_torch_ref(
     q_squared_sum_out: Optional[torch.Tensor] = None,
     k_squared_sum_out: Optional[torch.Tensor] = None,
     v_squared_sum_out: Optional[torch.Tensor] = None,
+    output_d_major: bool = False,  # noqa: ARG001 — SBUF layout only; accepted for signature parity with kernel
 ) -> Dict[str, torch.Tensor]:
     """Torch reference matching the qkv() kernel entry signature.
 
@@ -159,6 +160,7 @@ def qkv_torch_ref(
         slot_mapping (Optional[torch.Tensor]): Slot mapping [B, S] for block KV.
         store_output_in_sbuf (bool): Hardware-only, ignored. Default: False.
         sbm: Hardware-only, ignored.
+        output_d_major (bool): SBUF layout only (qkv_tkg at B*S == 1), ignored. Default: False.
         use_auto_allocation (bool): Hardware-only, ignored. Default: False.
         load_input_with_DMA_transpose (bool): Hardware-only, ignored. Default: True.
         is_h_dim_4h_transposed (bool): Whether input H-dim is pre-transposed by 4 (MX only). Default: False.

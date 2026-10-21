@@ -52,6 +52,7 @@ def qkv_tkg_torch_ref(
     sbm: Any = None,  # noqa: ARG001 — SbufManager is hardware-only; accepted for signature parity with kernel
     transposed_in: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    output_d_major: bool = False,  # noqa: ARG001 — SBUF layout only; accepted for signature parity with kernel
 ) -> Dict[str, torch.Tensor]:
     """
     PyTorch reference implementation for qkv_tkg kernel.
@@ -103,6 +104,8 @@ def qkv_tkg_torch_ref(
             If specified, normalization uses this value instead of H for mean calculation.
         transposed_in (bool): When True, hidden is [H0, n_prgs, H1_shard, BxS]; converted
             to [B, S, H] internally. Default: False.
+        output_d_major (bool): SBUF layout of the kernel output at B*S == 1; the reference
+            output is the same either way. Default: False.
 
     Returns:
         Dict[str, torch.Tensor]: Dictionary with the following keys:

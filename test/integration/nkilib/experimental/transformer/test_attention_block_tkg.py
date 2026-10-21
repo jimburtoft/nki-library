@@ -3070,6 +3070,14 @@ def _attn_blk_fast_marks(cfg: AttnBlkTestConfig) -> list:
 class TestRangeAttnBlk:
     # fmt: off
     FAST_ATTN_BLK_CFGS = [
+        # Single-token decode (B*S_tkg == 1) through the weight-stationary d-major QKV path, with
+        # pre-RoPE Q/K RMSNorm and a GQA block KV cache, at LNC 2 and 1.
+        AttnBlkTestConfig(batch=1, q_heads=4, d_head=128, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, lnc=2, kv_heads=2,
+                            cache_has_kv_head_dim=True),
+        AttnBlkTestConfig(batch=1, q_heads=4, d_head=128, H=2048, H_actual=None, S_ctx=512, S_max_ctx=512, S_tkg=1,
+                            block_len=32, qk_norm_pre_rope=True, qk_norm_pre_rope_gamma=True, lnc=1, kv_heads=2,
+                            cache_has_kv_head_dim=True),
         # Basic flat KV (core path: RMSNorm + QKV + RoPE + attention + output projection)
         AttnBlkTestConfig(batch=1, q_heads=1, d_head=128, H=8192, H_actual=None, S_ctx=1024, S_max_ctx=1024, S_tkg=1,
                             K_cache_transposed=True),

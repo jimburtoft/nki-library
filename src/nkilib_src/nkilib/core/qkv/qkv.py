@@ -136,6 +136,8 @@ def qkv(
     q_squared_sum_out: Optional[nl.NkiTensor] = None,
     k_squared_sum_out: Optional[nl.NkiTensor] = None,
     v_squared_sum_out: Optional[nl.NkiTensor] = None,
+    # --- d-major SBUF output for B*S == 1 (qkv_tkg only; see qkv_tkg output_d_major)
+    output_d_major: bool = False,
 ) -> nl.NkiTensor:
     """
     QKV (Query, Key, Value) projection kernel with multiple (optional) fused operations.
@@ -255,6 +257,10 @@ def qkv(
         When True, input is in transposed HBM layout [H0, n_prgs, H1_shard, BxS] instead of [B, S, H].
         Used for zero-conversion inter-layer data flow in the transformer megakernel.
         Only supported with qkv_tkg (small batch, B*S <= pmax). Requires LNC >= 2.
+    output_d_major : bool, default=False
+        Request the qkv_tkg d-major SBUF output [128, I // 128] at B*S == 1 (weight-stationary
+        projection). Ignored by qkv_cte and by qkv_tkg when its preconditions are not met;
+        callers detect the layout from the returned shape.
     dtype_mode : DtypeMode, default=DtypeMode.NON_OCP
         Quantization dtype policy for STATIC/ROW weight tiles. Also used for
         the FP8 KV cache when ``kv_dtype`` is the opaque ``"float8e4"``
@@ -418,6 +424,7 @@ def qkv(
             num_q_heads=num_q_heads,
             sbm=sbm,
             transposed_in=transposed_in,
+            output_d_major=output_d_major,
         )
 
     return output

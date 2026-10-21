@@ -88,6 +88,7 @@ def qkv_tkg(
     sbm: Optional[SbufManager] = None,
     transposed_in: bool = False,
     dtype_mode: DtypeMode = DtypeMode.NON_OCP,
+    output_d_major: bool = False,
 ) -> nl.NkiTensor | Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     QKV Projection Kernel for Token Generation
@@ -211,6 +212,14 @@ def qkv_tkg(
             ``qkv_cte``. ``qkv_tkg`` does not branch on this argument today —
             the FP8 dtype is determined by the caller-provided weight tensors
             and matmul accumulator dtype. Default: ``DtypeMode.NON_OCP``.
+        output_d_major (bool):
+            Request the d-major SBUF output [128, I // 128] (I on partitions, one column
+            per 128-wide I tile) instead of the token-major [BxS, I]. Honored only when
+            BxS == 1, output_in_sbuf, I % 128 == 0, no quantization and no bias; it then
+            uses a weight-stationary matmul (stationary W[128 H, 128 I], moving x[128 H, 1])
+            that accumulates all H tiles in fp32 PSUM (one bank per I tile) and needs no PSUM recombine.
+            When the conditions are not met the flag is ignored and the token-major path runs.
+            Callers detect the layout from the returned shape. Default: False.
 
     Returns:
         output (nl.NkiTensor | Tuple[nl.NkiTensor, nl.NkiTensor]):
@@ -344,8 +353,27 @@ def qkv_tkg(
     # Shard on H for qkv_w: (H0, H1_sharded, I)
     qkv_w_hbm = qkv_w.reshape_dim(dim=0, shape=(cfg.num_shards, cfg.H0, cfg.H1_shard)).select(dim=0, index=cfg.shard_id)
 
+    use_weight_stationary_b1 = (
+        output_d_major
+        and output_in_sbuf
+        and cfg.BxS == 1
+        and quantization_type == QuantizationType.NONE
+        and qkv_bias == None
+        and cfg.I % P_MAX == 0
+        and cfg.I // P_MAX <= NUM_PSUM_BANKS
+        and nisa.get_nc_version() != nisa.nc_version.gen2
+    )
+
     # Dispatch to appropriate projection path based output buffer
-    if output_in_sbuf:
+    if use_weight_stationary_b1:
+        output = _qkv_projection_weight_stationary_b1(
+            hidden_sb=hidden_sb,
+            qkv_w=qkv_w_hbm,
+            cfg=cfg,
+            sbm=sbm,
+            io_dtype=io_dtype,
+        )
+    elif output_in_sbuf:
         output = _qkv_projection_sbuf_output(
             hidden_sb=hidden_sb,
             qkv_w=qkv_w_hbm,
@@ -1283,6 +1311,110 @@ def _qkv_projection_sbuf_output(
         sbm.close_scope()
 
     return qkv_out_sb
+
+
+def _qkv_projection_weight_stationary_b1(
+    hidden_sb: nl.NkiTensor,
+    qkv_w: nl.NkiTensor,
+    cfg: QkvTkgConfig,
+    sbm: SbufManager,
+    io_dtype,
+) -> nl.NkiTensor:
+    """
+    Weight-stationary QKV projection for BxS == 1 with d-major SBUF output.
+
+    out[i0, i1] = sum_h W[h, i1 * 128 + i0] * x[h]
+
+    Stationary is a [128 H, 128 I] weight tile, moving is the [128 H, 1] hidden column.
+    All H tiles of this shard accumulate in fp32 PSUM (one bank per 128-wide I tile), so no
+    PSUM recombine is needed. With LNC > 1 the per-core fp32 partials (H-sharded) are
+    swapped over GPSIMD SB-to-SB and added once, then rounded to io_dtype.
+
+    Args:
+        hidden_sb: [H0, 1, H1_shard] @ SBUF
+        qkv_w: [H0, H1_shard, I] @ HBM (this shard's rows)
+        cfg: QKV TKG config (BxS must be 1)
+        sbm: SbufManager
+        io_dtype: output dtype
+
+    Returns:
+        [128, I // 128] @ SBUF in io_dtype (column n holds I indices n*128 .. n*128+127)
+    """
+    H0, H1_shard, I = cfg.H0, cfg.H1_shard, cfg.I
+    n_i_tiles = I // P_MAX
+    num_shards, shard_id = cfg.num_shards, cfg.shard_id
+    weight_dtype = qkv_w.dtype
+
+    # Output persists for the caller
+    qkv_out_T = sbm.alloc_heap((P_MAX, n_i_tiles), dtype=io_dtype, buffer=nl.sbuf, name="qkv_out_dmajor_sb")
+
+    sbm.open_scope(name="qkv_ws_b1")
+
+    # Load this shard's weight rows in two halves so the first matmuls can start before the
+    # whole shard has landed (the matmul loop below runs H-tile outermost).
+    qkv_w_sb = sbm.alloc_stack((H0, H1_shard, I), dtype=weight_dtype, buffer=nl.sbuf, name="qkv_ws_w_sb")
+    h_chunk = max(1, div_ceil(H1_shard, 2))
+    for h_block in TiledRange(H1_shard, h_chunk):
+        nisa.dma_copy(
+            qkv_w_sb.slice(dim=1, start=h_block.start_offset, end=h_block.end_offset),
+            qkv_w.slice(dim=1, start=h_block.start_offset, end=h_block.end_offset),
+        )
+
+    # One PSUM bank per I tile (column 0 of each), as in mlp_tkg_gate_up_projection_lhs_rhs_swap.
+    # Packing the N=1 accumulators as adjacent columns of one bank lost the first H tile's
+    # contribution of some columns on trn2 (observed in the qwen3asr B=1 harness), so each
+    # I tile gets its own bank.
+    result_psums = []
+    for i_tile in range(n_i_tiles):
+        result_psums.append(
+            nl.ndarray(
+                (P_MAX, F_MAX),
+                dtype=nl.float32,
+                name=f"{sbm.get_name_prefix()}qkv_ws_psum_{i_tile}",
+                buffer=nl.psum,
+                address=None
+                if sbm.is_auto_alloc()
+                else (0, (i_tile % NUM_PSUM_BANKS) * (F_MAX * sizeinbytes(nl.float32))),
+            )
+        )
+
+    for h1 in range(H1_shard):
+        hidden_col = hidden_sb.select(dim=2, index=h1)  # [H0, 1]
+        w_row = qkv_w_sb.select(dim=1, index=h1)  # [H0, I]
+        for i_tile in range(n_i_tiles):
+            nisa.nc_matmul(
+                result_psums[i_tile][:, 0:1],
+                w_row.slice(dim=1, start=i_tile * P_MAX, end=(i_tile + 1) * P_MAX),
+                hidden_col,
+            )
+
+    # Evict: one [128, 1] copy per I tile, alternating Vector / Scalar
+    evict_dst = qkv_out_T
+    if num_shards > 1:
+        evict_dst = sbm.alloc_stack((P_MAX, n_i_tiles), dtype=nl.float32, buffer=nl.sbuf, name="qkv_ws_partial")
+    for i_tile in range(n_i_tiles):
+        nisa.tensor_copy(
+            evict_dst[:, i_tile : i_tile + 1],
+            result_psums[i_tile][:, 0:1],
+            engine=nisa.engine.vector if i_tile % 2 == 0 else nisa.engine.scalar,
+        )
+
+    if num_shards > 1:
+        recv_sb = sbm.alloc_stack((P_MAX, n_i_tiles), dtype=nl.float32, buffer=nl.sbuf, name="qkv_ws_recv")
+        other_core = 1 - shard_id
+        use_gpsimd = n_i_tiles * sizeinbytes(nl.float32) <= 1024
+        nisa.sendrecv(
+            src=evict_dst,
+            dst=recv_sb,
+            send_to_rank=other_core,
+            recv_from_rank=other_core,
+            pipe_id=0,
+            dma_engine=nisa.dma_engine.gpsimd_dma if use_gpsimd else nisa.dma_engine.dma,
+        )
+        nisa.tensor_tensor(qkv_out_T, evict_dst, recv_sb, op=nl.add)
+
+    sbm.close_scope()
+    return qkv_out_T
 
 
 def _qkv_projection_hbm_output(
