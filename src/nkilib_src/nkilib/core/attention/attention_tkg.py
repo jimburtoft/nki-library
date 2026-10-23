@@ -81,6 +81,11 @@ _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock
 for _f in _CR17_FLAGS:
     if _f not in ("kcap64", "kcap128", "stitch", "evict"):
         raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
+    if _f != "stitch" and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
+        raise ValueError(
+            f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled: 'evict' gives wrong results on trn2 "
+            "and 'kcap64'/'kcap128' are slower. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only to reproduce the A/B."
+        )
 _CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
 _CR17_STITCH = "stitch" in _CR17_FLAGS
 _CR17_EVICT = "evict" in _CR17_FLAGS
