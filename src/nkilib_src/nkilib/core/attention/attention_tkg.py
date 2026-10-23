@@ -64,8 +64,11 @@ _MAX_FLOAT32 = float(np.finfo(np.float32).max)
 # to the output.
 INACTIVE_BLOCK_IDX = np.int32(-1)
 
-# Experimental A/B switch for batched block-KV decode (read once at import / trace time).
-# NKILIB_CR17_VARIANT is a '+'-joined list of flags; "stock" (default) leaves every path unchanged.
+# Batched block-KV decode switch (read once at import / trace time).
+# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "stitch" (measured on trn2: -19 to -24 % per
+# attention_tkg call at bs 32-64, output identical); "stock" restores the original paths.
+# Only "stitch" is recommended: "evict" gives WRONG results on hardware (PSUM bank sharing across batches,
+# not visible in the simulator) and "kcap64/kcap128" are 31-38 % slower on trn2.
 #   kcap64 / kcap128 : raise the trn2 (gen3) K dma_transpose batching cap from 32 to 64 / 128.
 #   stitch           : stitch k_active / v_active for a whole DMA-batch group with one copy / one DMA
 #                      instead of one per batch.
@@ -73,7 +76,7 @@ INACTIVE_BLOCK_IDX = np.int32(-1)
 #                      PSUM -> SBUF evictions run once per group instead of once per batch.
 # All flags apply only where _cr17_gate() holds (block KV, 2-byte KV, gen3, d_head 128, s_active 1,
 # unswapped QK, no row tiling, auto allocation, single NC on s_prior, bs_per_nc >= 32).
-_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "stock").strip().lower()
+_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "stitch").strip().lower()
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
 for _f in _CR17_FLAGS:
     if _f not in ("kcap64", "kcap128", "stitch", "evict"):
