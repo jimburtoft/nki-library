@@ -18,6 +18,7 @@ scenarios where the active sequence length is small (typically 8 or smaller).
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -62,6 +63,34 @@ _MAX_FLOAT32 = float(np.finfo(np.float32).max)
 # wasted memory bandwidth. The attention mask ensures they don't contribute
 # to the output.
 INACTIVE_BLOCK_IDX = np.int32(-1)
+
+# Batched block-KV decode switch (read once at import / trace time).
+# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "stitch" (measured on trn2: -19 to -24 % per
+# attention_tkg call at bs 32-64, output identical); "stock" restores the original paths.
+# Only "stitch" is recommended: "evict" gives WRONG results on hardware (PSUM bank sharing across batches,
+# not visible in the simulator) and "kcap64/kcap128" are 31-38 % slower on trn2.
+#   kcap64 / kcap128 : raise the trn2 (gen3) K dma_transpose batching cap from 32 to 64 / 128.
+#   stitch           : stitch k_active / v_active for a whole DMA-batch group with one copy / one DMA
+#                      instead of one per batch.
+#   evict            : share one PSUM tile across a group of batches for the QK and PV matmuls so the
+#                      PSUM -> SBUF evictions run once per group instead of once per batch.
+# All flags apply only where _cr17_gate() holds (block KV, 2-byte KV, gen3, d_head 128, s_active 1,
+# unswapped QK, no row tiling, auto allocation, single NC on s_prior, bs_per_nc >= 32).
+_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "stitch").strip().lower()
+_CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
+for _f in _CR17_FLAGS:
+    if _f not in ("kcap64", "kcap128", "stitch", "evict"):
+        raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
+    if _f != "stitch" and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
+        raise ValueError(
+            f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled: 'evict' gives wrong results on trn2 "
+            "and 'kcap64'/'kcap128' are slower. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only to reproduce the A/B."
+        )
+_CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
+_CR17_STITCH = "stitch" in _CR17_FLAGS
+_CR17_EVICT = "evict" in _CR17_FLAGS
+_CR17_EVICT_GROUP = 32  # batches per shared PSUM tile (QK and PV)
+_CR17_MIN_BS = 32
 
 
 @nki.jit
@@ -2296,6 +2325,8 @@ def _compute_qk_matmul(
         #    (removes per-batch DMA/compute overlap) until the TDG descriptor
         #    generation optimization lands. Raise to 64 once that CR merges.
         k_dma_batch_cap = 64 if nisa.get_nc_version() >= nisa.nc_version.gen4 else 32
+        if _CR17_KCAP and _cr17_gate(atp, cfg, sbm):
+            k_dma_batch_cap = _CR17_KCAP  # CR17 A/B: coarser K gather on trn2
         k_dma_batch_n_folds, k_dma_batch_n_batches = _compute_dma_batch_params(
             num_folds_this_tile, atp.bs, k_block_len_dma, cap=k_dma_batch_cap, sbm=sbm
         )
@@ -2586,7 +2617,19 @@ def _compute_qk_matmul(
                 nisa.dma_transpose(k_sb_view, k_prior_view)
 
         # If on final NC and last FA tile, add K_active to the end of k_sb
-        if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
+        _cr17_k_group_stitch = (
+            _CR17_STITCH
+            and _cr17_gate(atp, cfg, sbm)
+            and atp.use_dma_transpose
+            and k_dma_batch_n_batches > 1
+            and atp.bs % k_dma_batch_n_batches == 0
+        )
+        if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile and _cr17_k_group_stitch:
+            if i_b % k_dma_batch_n_batches == 0:
+                _cr17_stitch_k_active_group(
+                    k_sb, bufs, atp, cfg, TC, btc, i_b, k_dma_batch_n_batches, num_folds_this_tile, k_dma_batch_n_folds
+                )
+        elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
             _stitch_k_active(
                 k_sb,
                 bufs,
@@ -2626,6 +2669,61 @@ def _compute_qk_matmul(
         - Output: qk [P_MAX, n_sprior_tile * s_active_bqh] with batch interleaving
         - Memory: Each tile processes P_MAX rows of K against full Q per batch
         """
+
+        # CR17 'evict': batches share one PSUM tile [p_max, n_tiles * group * s_active_qh] (one bank); one
+        # select_reduce per group writes qk[:, tiles, g0:g0+group, :] instead of one eviction per batch.
+        _cr17_qk_grp = 0
+        if (
+            _CR17_EVICT
+            and _cr17_gate(atp, cfg, sbm)
+            and atp.use_dma_transpose
+            and not cfg.strided_mm1
+            and fa_tile_s_prior % TC.p_max == 0
+            and fa_tile_n_sprior * atp.s_active_qh <= TC.psum_f_max
+        ):
+            _cr17_qk_grp = min(_CR17_EVICT_GROUP, TC.psum_f_max // (fa_tile_n_sprior * atp.s_active_qh))
+        if _cr17_qk_grp > 1:
+            g0 = (i_b // _cr17_qk_grp) * _cr17_qk_grp
+            g_n = min(_cr17_qk_grp, atp.bs - g0)
+            i_loc = i_b - g0
+            if i_loc == 0:
+                qk_psum_grp = nl.ndarray(
+                    (TC.p_max, fa_tile_n_sprior * g_n * atp.s_active_qh), dtype=nl.float32, buffer=nl.psum
+                )
+            qk_psum_grp_view = qk_psum_grp.reshape_dim(1, [fa_tile_n_sprior, g_n, atp.s_active_qh])
+            q_off = (btc.global_batch_offset + i_b) * atp.s_active_qh
+            q_mov = bufs.q_sb[0 : cfg.d_head, q_off : q_off + atp.s_active_qh]
+            for i_t in range(fa_tile_n_sprior):
+                phys_tile = _k_tile_physical_index(
+                    i_t, k_block_len_row_tiled, k_dma_batch_n_folds, k_dma_batch_n_batches, i_b
+                )
+                nisa.nc_matmul(
+                    qk_psum_grp_view.select(1, i_t).select(1, i_loc),
+                    stationary=k_sb[0 : cfg.d_head, nl.ds(phys_tile * TC.p_max, TC.p_max)],
+                    moving=q_mov,
+                    accumulate=False,
+                )
+            if i_loc == g_n - 1:
+                # 2 free dims: [tile, (batch, head)] -- the group's batches are contiguous within a tile.
+                _gq = g_n * atp.s_active_qh
+                qk_sb_grp = (
+                    (bufs.qk)
+                    .reshape_dim(1, [fa_tile_n_sprior, atp.s_active_bqh])
+                    .slice(2, start=g0 * atp.s_active_qh, end=g0 * atp.s_active_qh + _gq)
+                )
+                mask_sb_grp = (
+                    (bufs.mask_sb)
+                    .reshape_dim(1, [fa_tile_n_sprior, atp.s_active_bqh])
+                    .slice(2, start=g0 * atp.s_active_qh, end=g0 * atp.s_active_qh + _gq)
+                )
+                nisa.select_reduce(
+                    dst=qk_sb_grp,
+                    predicate=mask_sb_grp,
+                    on_true=qk_psum_grp.reshape_dim(1, [fa_tile_n_sprior, _gq]),
+                    on_false=-np.inf,
+                )
+            sbm.increment_section()
+            continue
 
         for i_mm1_grp in range(div_ceil(fa_tile_s_prior, mm1_grp_sz)):
             # PSUM allocation
@@ -4417,7 +4515,27 @@ def _compute_pv_matmul_and_store(
             )
 
         # Load V_active to the last portion if needed (only on last FA tile)
-        if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
+        _cr17_v_group_stitch = (
+            _CR17_STITCH
+            and _cr17_gate(atp, cfg, sbm)
+            and v_dma_batch_n_batches > 1
+            and atp.bs % v_dma_batch_n_batches == 0
+        )
+        if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile and _cr17_v_group_stitch:
+            if i_b % v_dma_batch_n_batches == 0:
+                _cr17_stitch_v_active_group(
+                    v_sb_shared,
+                    bufs,
+                    atp,
+                    cfg,
+                    TC,
+                    btc,
+                    i_b,
+                    v_dma_batch_n_batches,
+                    fa_tile_n_sprior,
+                    num_folds_this_tile,
+                )
+        elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
             if atp.is_block_kv:
                 num_blks_covering_s_active = div_ceil(cfg.s_active, atp.block_len)
                 extra_covered = num_blks_covering_s_active * atp.block_len - cfg.s_active
@@ -4574,7 +4692,46 @@ def _compute_pv_matmul_and_store(
         dense_tiling = pv_dense_factor > 1
         pv_tile_factor = pv_dense_factor if dense_tiling else pv_col_tile_factor
         # Per-tile stride along the PSUM free axis between valid blocks: dense results walk the grid
-        # diagonal (stride s_active_qh), col results all share the same free columns (stride 0).
+        #    diagonal (stride s_active_qh), col results all share the same free columns (stride 0).
+        # CR17 'evict': batches share one PSUM tile [d_head, group * s_active_qh]; one eviction per group.
+        _cr17_pv_grp = 0
+        if (
+            _CR17_EVICT
+            and _cr17_gate(atp, cfg, sbm)
+            and pv_dense_factor == 1
+            and pv_col_tile_factor == 1
+            and atp.n_d_tiles == 1
+        ):
+            _cr17_pv_grp = min(_CR17_EVICT_GROUP, TC.psum_f_max // atp.s_active_qh)
+        if _cr17_pv_grp > 1:
+            g0 = (i_b // _cr17_pv_grp) * _cr17_pv_grp
+            g_n = min(_cr17_pv_grp, atp.bs - g0)
+            i_loc = i_b - g0
+            if i_loc == 0:
+                pv_psum_grp = nl.ndarray((cfg.d_head, g_n * atp.s_active_qh), dtype=nl.float32, buffer=nl.psum)
+            pv_dst = pv_psum_grp[:, i_loc * atp.s_active_qh : (i_loc + 1) * atp.s_active_qh]
+            for i_t in range(fa_tile_n_sprior):
+                p_mov = (
+                    (bufs.qk_io_type)
+                    .reshape_dim(1, [fa_tile_n_sprior, atp.s_active_bqh])
+                    .select(1, i_t)
+                    .slice(1, start=i_b * atp.s_active_qh, end=(i_b + 1) * atp.s_active_qh)
+                )
+                nisa.nc_matmul(
+                    pv_dst,
+                    stationary=v_sb[:, i_t * cfg.d_head : (i_t + 1) * cfg.d_head],
+                    moving=p_mov,
+                    accumulate=(i_t != 0),
+                )
+            if i_loc == g_n - 1:
+                ev_view = bufs.exp_v[: cfg.d_head, g0 * atp.s_active_qh : (g0 + g_n) * atp.s_active_qh]
+                if atp.use_online_softmax:
+                    nisa.tensor_copy(ev_view, pv_psum_grp)
+                else:
+                    recip_view = bufs.exp_sum_recip[: cfg.d_head, g0 * atp.s_active_qh : (g0 + g_n) * atp.s_active_qh]
+                    nisa.tensor_tensor(ev_view, pv_psum_grp, recip_view, op=nl.multiply)
+            sbm.increment_section()
+            continue
         psum_free_stride = atp.s_active_qh if dense_tiling else 0
         for i_d in range(atp.n_d_tiles):
             exp_v_psum = nl.ndarray(
@@ -5873,6 +6030,71 @@ def _stitch_k_active_swap(
 
 
 ### DMA Batching Helpers
+
+
+def _cr17_gate(atp, cfg, sbm) -> bool:
+    """Narrow gate for the NKILIB_CR17_VARIANT experimental paths (batched block-KV decode on trn2)."""
+    return (
+        len(_CR17_FLAGS) > 0
+        and atp.is_block_kv
+        and atp.use_dma_transpose
+        and not atp.is_fp8_kv
+        and not cfg.fp8_packed
+        and nisa.get_nc_version() == nisa.nc_version.gen3
+        and cfg.d_head == 128
+        and atp.n_d_tiles == 1
+        and cfg.s_active == 1
+        and not atp.qk_swapped
+        and atp.qk_row_tile_factor == 1
+        and sbm.is_auto_alloc()
+        and atp.sprior_n_prgs == 1
+        and not atp.use_fa
+        and atp.bs >= _CR17_MIN_BS
+    )
+
+
+def _cr17_stitch_k_active_group(k_sb, bufs, atp, cfg, TC, btc, i_b0, n_b, num_folds_this_tile, k_dma_batch_n_folds):
+    """CR17 'stitch': write k_active for n_b batches of one batched-DMA group with a single copy.
+
+    Requires s_active == 1, qk_row_tile_factor == 1, n_d_tiles == 1 and batch batching (k_dma_batch_n_batches
+    == n_b > 1, which implies k_dma_batch_n_folds == num_folds_this_tile). Layout from _k_tile_physical_index:
+    tile column of (batch g, last fold, pos p) = p * (n_folds * n_b) + g * n_folds + (n_folds - 1); the active
+    token sits in the last block slot (partition p_max - 1) at in-block position block_len - 1.
+    """
+    kernel_assert(k_dma_batch_n_folds == num_folds_this_tile, "CR17 stitch: expected all folds batched")
+    pos_in_fold = atp.block_len - 1
+    n_folds = k_dma_batch_n_folds
+    first_tile = pos_in_fold * n_folds * n_b + (n_folds - 1)
+    n_tiles = k_sb.shape[1] // TC.p_max
+    dst = (
+        (k_sb)
+        .reshape_dim(1, [n_tiles, TC.p_max])
+        .slice(1, start=first_tile, end=first_tile + (n_b - 1) * n_folds + 1, step=n_folds)
+        .slice(2, start=TC.p_max - 1, end=TC.p_max)
+    )
+    src = (
+        (bufs.k_active_sb)
+        .slice(1, start=btc.global_batch_offset + i_b0, end=btc.global_batch_offset + i_b0 + n_b)
+        .expand_dim(2)
+    )
+    nisa.tensor_copy(dst=dst, src=src)
+
+
+def _cr17_stitch_v_active_group(v_sb_shared, bufs, atp, cfg, TC, btc, i_b0, n_b, fa_tile_n_sprior, num_folds_this_tile):
+    """CR17 'stitch': write v_active for n_b batches of one batched V-DMA group with a single DMA.
+
+    v_sb_shared is [p_max, n_b * fa_tile_n_sprior * d_head]; batch g's active row goes to partition p_max - 1,
+    s-prior tile (num_folds_this_tile - 1) * block_len + block_len - 1 (s_active == 1)."""
+    tile_idx = (num_folds_this_tile - 1) * atp.block_len + atp.block_len - 1
+    dst = (
+        (v_sb_shared)
+        .slice(0, start=TC.p_max - 1, end=TC.p_max)
+        .reshape_dim(1, [n_b, fa_tile_n_sprior, cfg.d_head])
+        .select(2, tile_idx)
+    )
+    b0 = btc.global_batch_offset + i_b0
+    src = (bufs.v_active_reshaped).slice(0, start=b0, end=b0 + n_b).expand_dim(0)
+    nisa.dma_copy(dst=dst, src=src, name=f"cr17_v_active_group_b{i_b0}_bt{btc.batch_tile_idx}")
 
 
 def _compute_dma_batch_params(
