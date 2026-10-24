@@ -79,6 +79,9 @@ INACTIVE_BLOCK_IDX = np.int32(-1)
 #   fp8st  : 'stitch' for the packed FP8 KV path (fp8_packed): one k_active copy into the packed parity lane and
 #            one v_active DMA per DMA-batch group. Simulator bit-exact vs the per-sequence stitch; not HW-verified.
 #            (fp8_packed already keeps the K dma_transpose gather at block_len 4, so it needs no 'dt4'.)
+#   fp8kc16: packed FP8 K gather cap 16 bf16 rows instead of 32, i.e. the bf16 path's batches per gather (packed
+#            rows are block_len // 2, so the stock cap doubles the batches per gather; on bf16 that coarsening,
+#            'kcap64', was 31-38 % slower on trn2). Not HW-verified.
 # Refused always: kskip / kvskip (oob skip on the K dma_transpose gather HANGS the trn2 device).
 # All flags apply only where _cr17_gate() holds (block KV, 2-byte KV, gen3, d_head 128, s_active 1,
 # unswapped QK, no row tiling, auto allocation, single NC on s_prior, bs_per_nc >= 32).
@@ -86,7 +89,20 @@ _CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "dt4+stitch").strip().lowe
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
 _CR17_SUPPORTED = ("stitch", "dt4")
 for _f in _CR17_FLAGS:
-    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip", "vbuf", "dt4", "fp8st"):
+    if _f not in (
+        "kcap64",
+        "kcap128",
+        "stitch",
+        "evict",
+        "ktpe",
+        "kvskip",
+        "kskip",
+        "vskip",
+        "vbuf",
+        "dt4",
+        "fp8st",
+        "fp8kc16",
+    ):
         raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
     if _f in ("kskip", "kvskip"):
         raise ValueError(
@@ -95,7 +111,7 @@ for _f in _CR17_FLAGS:
     if _f not in _CR17_SUPPORTED and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
         raise ValueError(
             f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled ('evict' gives wrong results on trn2; "
-            "'kcap64'/'kcap128'/'ktpe' are slower; 'vbuf'/'vskip'/'fp8st' are not enabled by default). "
+            "'kcap64'/'kcap128'/'ktpe' are slower; 'vbuf'/'vskip'/'fp8st'/'fp8kc16' are not enabled by default). "
             "Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only to reproduce the A/B."
         )
 _CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
@@ -121,6 +137,7 @@ _CR17_VBUF = "vbuf" in _CR17_FLAGS
 # does not apply), d_head 128, s_active 1, 2-byte KV, gen3.
 _CR17_DT4 = "dt4" in _CR17_FLAGS
 _CR17_FP8ST = "fp8st" in _CR17_FLAGS
+_CR17_FP8KC16 = "fp8kc16" in _CR17_FLAGS
 _CR17_VSKIP_NBUF = int(os.environ.get("NKILIB_CR17_VBUF_N", "4"))
 _CR17_EVICT_GROUP = 32  # batches per shared PSUM tile (QK and PV)
 _CR17_MIN_BS = 32
@@ -2371,6 +2388,8 @@ def _compute_qk_matmul(
         k_dma_batch_cap = 64 if nisa.get_nc_version() >= nisa.nc_version.gen4 else 32
         if _CR17_KCAP and _cr17_gate(atp, cfg, sbm):
             k_dma_batch_cap = _CR17_KCAP  # CR17 A/B: coarser K gather on trn2
+        if _CR17_FP8KC16 and _cr17_gate_fp8(atp, cfg, sbm):
+            k_dma_batch_cap = 16  # packed FP8: same batches per gather as the bf16 path
         k_dma_batch_n_folds, k_dma_batch_n_batches = _compute_dma_batch_params(
             num_folds_this_tile, atp.bs, k_block_len_dma, cap=k_dma_batch_cap, sbm=sbm
         )
