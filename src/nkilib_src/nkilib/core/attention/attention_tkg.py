@@ -79,12 +79,13 @@ INACTIVE_BLOCK_IDX = np.int32(-1)
 _CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "stitch").strip().lower()
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
 for _f in _CR17_FLAGS:
-    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip"):
+    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip", "vbuf", "dt4"):
         raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
     if _f != "stitch" and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
         raise ValueError(
             f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled: 'evict' gives wrong results on trn2, "
-            "'kcap64'/'kcap128'/'ktpe' are slower, 'kvskip'/'kskip'/'vskip' are not HW-verified. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only "
+            "'kcap64'/'kcap128'/'ktpe' are slower, 'kskip'/'kvskip' HANG the trn2 device (oob skip on the K "
+            "dma_transpose gather), 'vskip' (2 buffers) is slower, 'vbuf'/'dt4' are not HW-verified. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only "
             "to reproduce / run the A/B."
         )
 _CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
@@ -100,7 +101,16 @@ _CR17_KTPE_CAP = 128  # positions (batches * folds * block_len) per K dma_copy g
 # (V group buffers are persistent and zeroed once), and their softmax weight is exactly 0.
 _CR17_KSKIP = "kskip" in _CR17_FLAGS or "kvskip" in _CR17_FLAGS
 _CR17_VSKIP = "vskip" in _CR17_FLAGS or "kvskip" in _CR17_FLAGS
-_CR17_VSKIP_NBUF = 2  # persistent V group buffers (ping-pong)
+# 'vbuf': the V group buffers become NKILIB_CR17_VBUF_N persistent buffers (zeroed once) without skip -- the A/B that
+# separates the buffering change from the skip itself. vskip uses the same buffers. Default 4 keeps the V prefetch depth
+# measured with stitch (3-4 groups in flight); 2 reproduces the HW-measured round-3 vskip (+9.7 %).
+_CR17_VBUF = "vbuf" in _CR17_FLAGS
+# 'dt4': keep the K dma_transpose gather when the resized block_len is 4 (decode bucket 512 with 32-token vLLM
+# blocks) instead of falling back to the PE-transpose path, which is ~38 % slower than the 1024 bucket on trn2
+# at bs_attn 51 (1043 vs 758 us measured). Only at large folded batch (the fallback's "too few batches" reason
+# does not apply), d_head 128, s_active 1, 2-byte KV, gen3.
+_CR17_DT4 = "dt4" in _CR17_FLAGS
+_CR17_VSKIP_NBUF = int(os.environ.get("NKILIB_CR17_VBUF_N", "4"))
 _CR17_EVICT_GROUP = 32  # batches per shared PSUM tile (QK and PV)
 _CR17_MIN_BS = 32
 
@@ -1530,7 +1540,18 @@ def _setup_block_kv_cache(
     # and small block_len leads to too many folds per batch.
     # fp8_packed always uses DMA transpose (no PE transpose fallback for packed layout).
     if not cfg.fp8_packed:
-        if (block_len < 8) or (block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2):
+        _cr17_dt4 = (
+            _CR17_DT4
+            and block_len == 4
+            and cfg.d_head == 128
+            and cfg.s_active == 1
+            and not atp.is_fp8_kv
+            and cfg.bs >= _CR17_MIN_BS
+            and nisa.get_nc_version() == nisa.nc_version.gen3
+        )
+        if ((block_len < 8) and not _cr17_dt4) or (
+            block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2
+        ):
             atp.use_dma_transpose = False
 
     # assign to atp (can't do directly because function return value cannot be assigned to object)
@@ -4454,8 +4475,8 @@ def _compute_pv_matmul_and_store(
     # HW col tiling. Mutually exclusive with dense tiling.
     pv_col_tile_factor = pv_array_tiling_factor if (pv_dense_factor == 1 and pv_array_tiling_ok) else 1
     v_idx_src = bufs.active_blocks_sb if atp.use_v_dma_skipping else bufs.active_blocks_sb_u32
-    _cr17_vskip = (
-        _CR17_VSKIP
+    _cr17_vpersist = (
+        (_CR17_VSKIP or _CR17_VBUF)
         and _cr17_gate(atp, cfg, sbm)
         and not atp.use_v_dma_skipping
         and v_dma_batch_n_batches > 1
@@ -4463,6 +4484,7 @@ def _compute_pv_matmul_and_store(
         and pv_dense_factor == 1
         and pv_col_tile_factor == 1
     )
+    _cr17_vskip = _cr17_vpersist and _CR17_VSKIP
     if _cr17_vskip:
         v_idx_src = _cr17_skip_index_table(bufs, atp.bs * atp.num_folds_per_batch, TC, sbm)
     if v_dma_batch_size > 1:
@@ -4478,14 +4500,15 @@ def _compute_pv_matmul_and_store(
     _v_sb_dtype = atp.kv_e4m3_tile_dtype if atp.is_fp8_kv else v_prior.dtype
     v_sb_shared = None
     _cr17_vbufs = []
-    if _cr17_vskip:
+    if _cr17_vpersist:
         # Persistent, zeroed group buffers: skipped (padding) rows only ever hold 0 or earlier finite V data,
         # so 0-weight * stale stays exactly 0 (no per-group memset).
         for _i in range(_CR17_VSKIP_NBUF):
             _vb = sbm.alloc_stack(
                 (TC.p_max, cfg.d_head * fa_tile_n_sprior * v_dma_batch_n_batches), dtype=_v_sb_dtype, buffer=nl.sbuf
             )
-            nisa.memset(_vb, value=0)
+            if _cr17_vskip:
+                nisa.memset(_vb, value=0)
             _cr17_vbufs.append(_vb)
 
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="pv_matmul")
@@ -4496,7 +4519,7 @@ def _compute_pv_matmul_and_store(
         per_batch_v_size = cfg.d_head * fa_tile_n_sprior
         if v_dma_batch_n_batches > 1:
             b_in_group = i_b % v_dma_batch_n_batches
-            if b_in_group == 0 and _cr17_vskip:
+            if b_in_group == 0 and _cr17_vpersist:
                 v_sb_shared = _cr17_vbufs[(i_b // v_dma_batch_n_batches) % _CR17_VSKIP_NBUF]
             elif b_in_group == 0:
                 v_sb_shared = sbm.alloc_stack(
