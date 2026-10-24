@@ -79,12 +79,12 @@ INACTIVE_BLOCK_IDX = np.int32(-1)
 _CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "stitch").strip().lower()
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
 for _f in _CR17_FLAGS:
-    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe"):
+    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip"):
         raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
     if _f != "stitch" and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
         raise ValueError(
             f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled: 'evict' gives wrong results on trn2, "
-            "'kcap64'/'kcap128' are slower, 'ktpe' is not HW-verified. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only "
+            "'kcap64'/'kcap128'/'ktpe' are slower, 'kvskip'/'kskip'/'vskip' are not HW-verified. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only "
             "to reproduce / run the A/B."
         )
 _CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
@@ -94,6 +94,13 @@ _CR17_EVICT = "evict" in _CR17_FLAGS
 # copy rate) and transposed on the PE (otherwise idle at this shape) instead of the SWDGE dma_transpose gather.
 _CR17_KTPE = "ktpe" in _CR17_FLAGS
 _CR17_KTPE_CAP = 128  # positions (batches * folds * block_len) per K dma_copy group, same as V_CAP
+# 'kvskip' (= 'kskip' + 'vskip'; experimental, not HW-verified): inactive (padding) block slots get an out-of-bounds
+# gather index and the K dma_transpose / V dma_copy run with oob_mode.skip, so blocks past each sequence's context
+# are not read. Skipped K columns are masked to -inf by the existing select_reduce; skipped V rows keep finite data
+# (V group buffers are persistent and zeroed once), and their softmax weight is exactly 0.
+_CR17_KSKIP = "kskip" in _CR17_FLAGS or "kvskip" in _CR17_FLAGS
+_CR17_VSKIP = "vskip" in _CR17_FLAGS or "kvskip" in _CR17_FLAGS
+_CR17_VSKIP_NBUF = 2  # persistent V group buffers (ping-pong)
 _CR17_EVICT_GROUP = 32  # batches per shared PSUM tile (QK and PV)
 _CR17_MIN_BS = 32
 
@@ -2362,6 +2369,10 @@ def _compute_qk_matmul(
             # matmul loop below reads k_sb in logical tile order (one batch slice at a time)
             k_dma_batch_n_folds, k_dma_batch_n_batches = 1, 1
 
+    _cr17_kskip_tbl = None
+    if _CR17_KSKIP and _cr17_gate(atp, cfg, sbm) and not cfg.fp8_packed and _cr17_ktpe_n_b == 0:
+        _cr17_kskip_tbl = _cr17_skip_index_table(bufs, atp.bs * num_folds_this_tile, TC, sbm)
+
     k_sb_shared = None
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="qk_matmul")
     for i_b in range(atp.bs):
@@ -2443,9 +2454,9 @@ def _compute_qk_matmul(
                     k_dma_batch_size = k_dma_batch_n_folds * k_dma_batch_n_batches
                     idx_start = i_b * num_folds_this_tile + i_fold_rel
 
-                    blks_u32 = (bufs.active_blocks_sb_u32).slice(
-                        dim=1, start=idx_start, end=idx_start + k_dma_batch_size
-                    )
+                    blks_u32 = (
+                        bufs.active_blocks_sb_u32 if _cr17_kskip_tbl is None else _cr17_kskip_tbl
+                    ).slice(dim=1, start=idx_start, end=idx_start + k_dma_batch_size)
 
                     dst_start = i_fold_rel * k_block_len_row_tiled * TC.p_max if k_dma_batch_n_batches == 1 else 0
                     dst_end = dst_start + k_dma_batch_size * k_block_len_row_tiled * TC.p_max
@@ -2474,6 +2485,7 @@ def _compute_qk_matmul(
                         ),
                         axes=(3, 1, 2, 0),
                         dge_mode=nisa.dge_mode.swdge,
+                        oob_mode=nisa.oob_mode.error if _cr17_kskip_tbl is None else nisa.oob_mode.skip,
                     )
                 else:
                     # PE transpose path: indirect DMA load + PE transposes per fold
@@ -4442,6 +4454,17 @@ def _compute_pv_matmul_and_store(
     # HW col tiling. Mutually exclusive with dense tiling.
     pv_col_tile_factor = pv_array_tiling_factor if (pv_dense_factor == 1 and pv_array_tiling_ok) else 1
     v_idx_src = bufs.active_blocks_sb if atp.use_v_dma_skipping else bufs.active_blocks_sb_u32
+    _cr17_vskip = (
+        _CR17_VSKIP
+        and _cr17_gate(atp, cfg, sbm)
+        and not atp.use_v_dma_skipping
+        and v_dma_batch_n_batches > 1
+        and v_dma_batch_n_folds == atp.num_folds_per_batch
+        and pv_dense_factor == 1
+        and pv_col_tile_factor == 1
+    )
+    if _cr17_vskip:
+        v_idx_src = _cr17_skip_index_table(bufs, atp.bs * atp.num_folds_per_batch, TC, sbm)
     if v_dma_batch_size > 1:
         # V's batched dma_copy reads a [128, N] vector_offset in column-major ("snake") order, so the
         # index table must be pre-rearranged into that layout. The K path uses dma_transpose instead,
@@ -4454,6 +4477,16 @@ def _compute_pv_matmul_and_store(
     # dtype_mode resolution for opaque "float8e4"). Otherwise pass through v_prior.dtype.
     _v_sb_dtype = atp.kv_e4m3_tile_dtype if atp.is_fp8_kv else v_prior.dtype
     v_sb_shared = None
+    _cr17_vbufs = []
+    if _cr17_vskip:
+        # Persistent, zeroed group buffers: skipped (padding) rows only ever hold 0 or earlier finite V data,
+        # so 0-weight * stale stays exactly 0 (no per-group memset).
+        for _i in range(_CR17_VSKIP_NBUF):
+            _vb = sbm.alloc_stack(
+                (TC.p_max, cfg.d_head * fa_tile_n_sprior * v_dma_batch_n_batches), dtype=_v_sb_dtype, buffer=nl.sbuf
+            )
+            nisa.memset(_vb, value=0)
+            _cr17_vbufs.append(_vb)
 
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="pv_matmul")
     for i_b in range(atp.bs):
@@ -4463,7 +4496,9 @@ def _compute_pv_matmul_and_store(
         per_batch_v_size = cfg.d_head * fa_tile_n_sprior
         if v_dma_batch_n_batches > 1:
             b_in_group = i_b % v_dma_batch_n_batches
-            if b_in_group == 0:
+            if b_in_group == 0 and _cr17_vskip:
+                v_sb_shared = _cr17_vbufs[(i_b // v_dma_batch_n_batches) % _CR17_VSKIP_NBUF]
+            elif b_in_group == 0:
                 v_sb_shared = sbm.alloc_stack(
                     (TC.p_max, per_batch_v_size * v_dma_batch_n_batches), dtype=_v_sb_dtype, buffer=nl.sbuf
                 )
@@ -4524,7 +4559,7 @@ def _compute_pv_matmul_and_store(
                         vector_offset=v_idx_slice,
                         indirect_dim=0,
                     ),
-                    oob_mode=nisa.oob_mode.skip if atp.use_v_dma_skipping else nisa.oob_mode.error,
+                    oob_mode=nisa.oob_mode.skip if (atp.use_v_dma_skipping or _cr17_vskip) else nisa.oob_mode.error,
                     name=f"v_prior_block_load_indirect_fa{fa_ctx.fa_tile_idx}_b{i_b}_f{i_fold}_bt{btc.batch_tile_idx}",
                 )
             sbm.close_scope()
@@ -6163,6 +6198,22 @@ def _cr17_ktpe_load_group(bufs, atp, cfg, TC, sbm, btc, i_b0, n_b, n_folds, idx_
     src = (bufs.k_active_sb).slice(1, start=b0, end=b0 + n_b).expand_dim(2)
     nisa.tensor_copy(dst=dst, src=src)
     return k_grp
+
+
+def _cr17_skip_index_table(bufs, total_cols, TC, sbm):
+    """CR17 'kvskip': uint32 gather-index table in which every inactive slot (negative in the signed table) holds an
+    out-of-bounds row index (the KV pool row count), for oob_mode.skip. Active slots are unchanged."""
+    n_rows = max(bufs.k_prior_reshaped.shape[0], bufs.v_prior_reshaped.shape[0])
+    tbl = sbm.alloc_stack((TC.p_max, total_cols), dtype=nl.uint32, buffer=nl.sbuf, align=32)
+    nisa.tensor_copy(tbl, bufs.active_blocks_sb_u32, engine=nisa.vector_engine)
+    sbm.open_scope()
+    inactive = sbm.alloc_stack((TC.p_max, total_cols), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=inactive, data=bufs.active_blocks_sb, op0=nl.less, operand0=0)
+    oob = sbm.alloc_stack((TC.p_max, total_cols), dtype=nl.uint32, buffer=nl.sbuf)
+    nisa.iota(dst=oob, pattern=[[0, total_cols]], offset=n_rows, channel_multiplier=0)
+    nisa.tensor_copy_predicated(dst=tbl, src=oob, predicate=inactive)
+    sbm.close_scope()
+    return tbl
 
 
 def _cr17_stitch_v_active_group(v_sb_shared, bufs, atp, cfg, TC, btc, i_b0, n_b, fa_tile_n_sprior, num_folds_this_tile):
