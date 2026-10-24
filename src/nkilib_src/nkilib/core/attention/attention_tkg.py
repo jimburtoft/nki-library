@@ -65,30 +65,59 @@ _MAX_FLOAT32 = float(np.finfo(np.float32).max)
 INACTIVE_BLOCK_IDX = np.int32(-1)
 
 # Batched block-KV decode switch (read once at import / trace time).
-# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "stitch" (measured on trn2: -19 to -24 % per
-# attention_tkg call at bs 32-64, output identical); "stock" restores the original paths.
-# Only "stitch" is recommended: "evict" gives WRONG results on hardware (PSUM bank sharing across batches,
-# not visible in the simulator) and "kcap64/kcap128" are 31-38 % slower on trn2.
-#   kcap64 / kcap128 : raise the trn2 (gen3) K dma_transpose batching cap from 32 to 64 / 128.
-#   stitch           : stitch k_active / v_active for a whole DMA-batch group with one copy / one DMA
-#                      instead of one per batch.
-#   evict            : share one PSUM tile across a group of batches for the QK and PV matmuls so the
-#                      PSUM -> SBUF evictions run once per group instead of once per batch.
+# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "dt4+stitch" (HW-verified on trn2, outputs identical
+# to the original paths); "stock" restores the original paths. Supported flags:
+#   stitch : write the active token's K / V once per DMA-batch group instead of once per sequence
+#            (attention_tkg -19 to -24 % at bs 32-64, bucket 1024).
+#   dt4    : keep the K dma_transpose gather at resized block_len 4 (decode bucket 512 with 32-token blocks)
+#            instead of the PE-transpose fallback (-54 to -57 % at bucket 512); this is what makes a 512 decode
+#            context bucket faster than 1024.
+# Experimental flags (A/B reproduction only; need NKILIB_CR17_ALLOW_EXPERIMENTAL=1):
+#   evict  : WRONG results on trn2 (PSUM bank sharing across batches; bit-identical in the simulator).
+#   kcap64 / kcap128 : coarser K gather, 31-38 % slower.   ktpe : K via dma_copy + PE transpose, 5-10 % slower.
+#   vbuf / vskip     : persistent V buffers (+ oob skip on V); within -2..-7 % / neutral, not enabled by default.
+# Refused always: kskip / kvskip (oob skip on the K dma_transpose gather HANGS the trn2 device).
 # All flags apply only where _cr17_gate() holds (block KV, 2-byte KV, gen3, d_head 128, s_active 1,
 # unswapped QK, no row tiling, auto allocation, single NC on s_prior, bs_per_nc >= 32).
-_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "stitch").strip().lower()
+_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "dt4+stitch").strip().lower()
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
+_CR17_SUPPORTED = ("stitch", "dt4")
 for _f in _CR17_FLAGS:
-    if _f not in ("kcap64", "kcap128", "stitch", "evict"):
+    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip", "vbuf", "dt4"):
         raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
-    if _f != "stitch" and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
+    if _f in ("kskip", "kvskip"):
         raise ValueError(
-            f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled: 'evict' gives wrong results on trn2 "
-            "and 'kcap64'/'kcap128' are slower. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only to reproduce the A/B."
+            f"NKILIB_CR17_VARIANT flag {_f!r} is refused: oob skip on the K dma_transpose gather hangs trn2."
+        )
+    if _f not in _CR17_SUPPORTED and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
+        raise ValueError(
+            f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled ('evict' gives wrong results on trn2; "
+            "'kcap64'/'kcap128'/'ktpe' are slower; 'vbuf'/'vskip' are not enabled by default). "
+            "Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only to reproduce the A/B."
         )
 _CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
 _CR17_STITCH = "stitch" in _CR17_FLAGS
 _CR17_EVICT = "evict" in _CR17_FLAGS
+# 'ktpe' (experimental, not HW-verified): K_prior loaded with the batched indirect dma_copy used for V (plain
+# copy rate) and transposed on the PE (otherwise idle at this shape) instead of the SWDGE dma_transpose gather.
+_CR17_KTPE = "ktpe" in _CR17_FLAGS
+_CR17_KTPE_CAP = 128  # positions (batches * folds * block_len) per K dma_copy group, same as V_CAP
+# 'kvskip' (= 'kskip' + 'vskip'; experimental, not HW-verified): inactive (padding) block slots get an out-of-bounds
+# gather index and the K dma_transpose / V dma_copy run with oob_mode.skip, so blocks past each sequence's context
+# are not read. Skipped K columns are masked to -inf by the existing select_reduce; skipped V rows keep finite data
+# (V group buffers are persistent and zeroed once), and their softmax weight is exactly 0.
+_CR17_KSKIP = "kskip" in _CR17_FLAGS or "kvskip" in _CR17_FLAGS
+_CR17_VSKIP = "vskip" in _CR17_FLAGS or "kvskip" in _CR17_FLAGS
+# 'vbuf': the V group buffers become NKILIB_CR17_VBUF_N persistent buffers (zeroed once) without skip -- the A/B that
+# separates the buffering change from the skip itself. vskip uses the same buffers. Default 4 keeps the V prefetch depth
+# measured with stitch (3-4 groups in flight); 2 reproduces the HW-measured round-3 vskip (+9.7 %).
+_CR17_VBUF = "vbuf" in _CR17_FLAGS
+# 'dt4': keep the K dma_transpose gather when the resized block_len is 4 (decode bucket 512 with 32-token vLLM
+# blocks) instead of falling back to the PE-transpose path, which is ~38 % slower than the 1024 bucket on trn2
+# at bs_attn 51 (1043 vs 758 us measured). Only at large folded batch (the fallback's "too few batches" reason
+# does not apply), d_head 128, s_active 1, 2-byte KV, gen3.
+_CR17_DT4 = "dt4" in _CR17_FLAGS
+_CR17_VSKIP_NBUF = int(os.environ.get("NKILIB_CR17_VBUF_N", "4"))
 _CR17_EVICT_GROUP = 32  # batches per shared PSUM tile (QK and PV)
 _CR17_MIN_BS = 32
 
@@ -1518,7 +1547,18 @@ def _setup_block_kv_cache(
     # and small block_len leads to too many folds per batch.
     # fp8_packed always uses DMA transpose (no PE transpose fallback for packed layout).
     if not cfg.fp8_packed:
-        if (block_len < 8) or (block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2):
+        _cr17_dt4 = (
+            _CR17_DT4
+            and block_len == 4
+            and cfg.d_head == 128
+            and cfg.s_active == 1
+            and not atp.is_fp8_kv
+            and cfg.bs >= _CR17_MIN_BS
+            and nisa.get_nc_version() == nisa.nc_version.gen3
+        )
+        if ((block_len < 8) and not _cr17_dt4) or (
+            block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2
+        ):
             atp.use_dma_transpose = False
 
     # assign to atp (can't do directly because function return value cannot be assigned to object)
@@ -2331,6 +2371,34 @@ def _compute_qk_matmul(
             num_folds_this_tile, atp.bs, k_block_len_dma, cap=k_dma_batch_cap, sbm=sbm
         )
 
+    # CR17 'ktpe': K loaded like V (batched indirect dma_copy, natural [block, (batch, pos, d)] layout) and
+    # transposed on the PE (8 transposes per PSUM bank, one eviction per bank) instead of dma_transpose.
+    _cr17_ktpe_n_b = 0
+    _cr17_ktpe_idx = None
+    _cr17_ktpe_n_tiles = 0
+    if (
+        _CR17_KTPE
+        and _cr17_gate(atp, cfg, sbm)
+        and atp.is_block_kv
+        and not cfg.fp8_packed
+        and num_folds_this_tile == atp.num_folds_per_batch
+        and num_folds_this_tile * atp.block_len * TC.p_max == fa_tile_s_prior
+        and is_last_fa_tile
+    ):
+        _kf, _kb = _compute_dma_batch_params(num_folds_this_tile, atp.bs, atp.block_len, cap=_CR17_KTPE_CAP, sbm=sbm)
+        if _kf == num_folds_this_tile and _kb > 1 and atp.bs % _kb == 0:
+            _cr17_ktpe_n_b = _kb
+            _cr17_ktpe_n_tiles = num_folds_this_tile * atp.block_len
+            _cr17_ktpe_idx = _rearrange_indices_for_batched_dma(
+                bufs.active_blocks_sb_u32, atp.bs * num_folds_this_tile, _kb * num_folds_this_tile, TC, sbm
+            )
+            # matmul loop below reads k_sb in logical tile order (one batch slice at a time)
+            k_dma_batch_n_folds, k_dma_batch_n_batches = 1, 1
+
+    _cr17_kskip_tbl = None
+    if _CR17_KSKIP and _cr17_gate(atp, cfg, sbm) and not cfg.fp8_packed and _cr17_ktpe_n_b == 0:
+        _cr17_kskip_tbl = _cr17_skip_index_table(bufs, atp.bs * num_folds_this_tile, TC, sbm)
+
     k_sb_shared = None
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="qk_matmul")
     for i_b in range(atp.bs):
@@ -2340,7 +2408,25 @@ def _compute_qk_matmul(
         # Requires sufficient s_prior for the packed DMA layout (small SWA windows excluded).
         # For fp8_packed: allocate as bf16 with half the seq length (each bf16 slot holds 2 fp8 values)
         # For batch-batching: allocate a fresh shared buffer per group to avoid anti-deps.
-        if atp.use_dma_transpose and k_dma_batch_n_batches > 1:
+        if _cr17_ktpe_n_b > 1:
+            _g = i_b % _cr17_ktpe_n_b
+            if _g == 0:
+                k_sb_shared = _cr17_ktpe_load_group(
+                    bufs,
+                    atp,
+                    cfg,
+                    TC,
+                    sbm,
+                    btc,
+                    i_b,
+                    _cr17_ktpe_n_b,
+                    num_folds_this_tile,
+                    _cr17_ktpe_idx,
+                    _k_sb_dtype,
+                )
+            _ncols = _cr17_ktpe_n_tiles * TC.p_max
+            k_sb = (k_sb_shared).slice(1, start=_g * _ncols, end=(_g + 1) * _ncols)
+        elif atp.use_dma_transpose and k_dma_batch_n_batches > 1:
             if (i_b % k_dma_batch_n_batches) == 0:
                 _k_sb_free_per_batch = num_folds_this_tile * k_block_len_row_tiled * TC.p_max
                 k_sb_shared = sbm.alloc_stack(
@@ -2375,7 +2461,9 @@ def _compute_qk_matmul(
                 buffer=nl.sbuf,
                 align=32,
             )
-        if atp.is_block_kv:
+        if _cr17_ktpe_n_b > 1:
+            pass  # K for this batch was loaded, transposed and k_active-stitched by _cr17_ktpe_load_group
+        elif atp.is_block_kv:
             sbm.open_scope()
             for i_fold_rel in range(num_folds_this_tile):
                 i_fold = fold_start + i_fold_rel
@@ -2401,7 +2489,7 @@ def _compute_qk_matmul(
                     k_dma_batch_size = k_dma_batch_n_folds * k_dma_batch_n_batches
                     idx_start = i_b * num_folds_this_tile + i_fold_rel
 
-                    blks_u32 = (bufs.active_blocks_sb_u32).slice(
+                    blks_u32 = (bufs.active_blocks_sb_u32 if _cr17_kskip_tbl is None else _cr17_kskip_tbl).slice(
                         dim=1, start=idx_start, end=idx_start + k_dma_batch_size
                     )
 
@@ -2432,6 +2520,7 @@ def _compute_qk_matmul(
                         ),
                         axes=(3, 1, 2, 0),
                         dge_mode=nisa.dge_mode.swdge,
+                        oob_mode=nisa.oob_mode.error if _cr17_kskip_tbl is None else nisa.oob_mode.skip,
                     )
                 else:
                     # PE transpose path: indirect DMA load + PE transposes per fold
@@ -2624,7 +2713,9 @@ def _compute_qk_matmul(
             and k_dma_batch_n_batches > 1
             and atp.bs % k_dma_batch_n_batches == 0
         )
-        if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile and _cr17_k_group_stitch:
+        if _cr17_ktpe_n_b > 1:
+            pass
+        elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile and _cr17_k_group_stitch:
             if i_b % k_dma_batch_n_batches == 0:
                 _cr17_stitch_k_active_group(
                     k_sb, bufs, atp, cfg, TC, btc, i_b, k_dma_batch_n_batches, num_folds_this_tile, k_dma_batch_n_folds
@@ -4398,6 +4489,18 @@ def _compute_pv_matmul_and_store(
     # HW col tiling. Mutually exclusive with dense tiling.
     pv_col_tile_factor = pv_array_tiling_factor if (pv_dense_factor == 1 and pv_array_tiling_ok) else 1
     v_idx_src = bufs.active_blocks_sb if atp.use_v_dma_skipping else bufs.active_blocks_sb_u32
+    _cr17_vpersist = (
+        (_CR17_VSKIP or _CR17_VBUF)
+        and _cr17_gate(atp, cfg, sbm)
+        and not atp.use_v_dma_skipping
+        and v_dma_batch_n_batches > 1
+        and v_dma_batch_n_folds == atp.num_folds_per_batch
+        and pv_dense_factor == 1
+        and pv_col_tile_factor == 1
+    )
+    _cr17_vskip = _cr17_vpersist and _CR17_VSKIP
+    if _cr17_vskip:
+        v_idx_src = _cr17_skip_index_table(bufs, atp.bs * atp.num_folds_per_batch, TC, sbm)
     if v_dma_batch_size > 1:
         # V's batched dma_copy reads a [128, N] vector_offset in column-major ("snake") order, so the
         # index table must be pre-rearranged into that layout. The K path uses dma_transpose instead,
@@ -4410,6 +4513,17 @@ def _compute_pv_matmul_and_store(
     # dtype_mode resolution for opaque "float8e4"). Otherwise pass through v_prior.dtype.
     _v_sb_dtype = atp.kv_e4m3_tile_dtype if atp.is_fp8_kv else v_prior.dtype
     v_sb_shared = None
+    _cr17_vbufs = []
+    if _cr17_vpersist:
+        # Persistent, zeroed group buffers: skipped (padding) rows only ever hold 0 or earlier finite V data,
+        # so 0-weight * stale stays exactly 0 (no per-group memset).
+        for _i in range(_CR17_VSKIP_NBUF):
+            _vb = sbm.alloc_stack(
+                (TC.p_max, cfg.d_head * fa_tile_n_sprior * v_dma_batch_n_batches), dtype=_v_sb_dtype, buffer=nl.sbuf
+            )
+            if _cr17_vskip:
+                nisa.memset(_vb, value=0)
+            _cr17_vbufs.append(_vb)
 
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="pv_matmul")
     for i_b in range(atp.bs):
@@ -4419,7 +4533,9 @@ def _compute_pv_matmul_and_store(
         per_batch_v_size = cfg.d_head * fa_tile_n_sprior
         if v_dma_batch_n_batches > 1:
             b_in_group = i_b % v_dma_batch_n_batches
-            if b_in_group == 0:
+            if b_in_group == 0 and _cr17_vpersist:
+                v_sb_shared = _cr17_vbufs[(i_b // v_dma_batch_n_batches) % _CR17_VSKIP_NBUF]
+            elif b_in_group == 0:
                 v_sb_shared = sbm.alloc_stack(
                     (TC.p_max, per_batch_v_size * v_dma_batch_n_batches), dtype=_v_sb_dtype, buffer=nl.sbuf
                 )
@@ -4480,7 +4596,7 @@ def _compute_pv_matmul_and_store(
                         vector_offset=v_idx_slice,
                         indirect_dim=0,
                     ),
-                    oob_mode=nisa.oob_mode.skip if atp.use_v_dma_skipping else nisa.oob_mode.error,
+                    oob_mode=nisa.oob_mode.skip if (atp.use_v_dma_skipping or _cr17_vskip) else nisa.oob_mode.error,
                     name=f"v_prior_block_load_indirect_fa{fa_ctx.fa_tile_idx}_b{i_b}_f{i_fold}_bt{btc.batch_tile_idx}",
                 )
             sbm.close_scope()
@@ -6078,6 +6194,72 @@ def _cr17_stitch_k_active_group(k_sb, bufs, atp, cfg, TC, btc, i_b0, n_b, num_fo
         .expand_dim(2)
     )
     nisa.tensor_copy(dst=dst, src=src)
+
+
+def _cr17_ktpe_load_group(bufs, atp, cfg, TC, sbm, btc, i_b0, n_b, n_folds, idx_table, k_dtype):
+    """CR17 'ktpe': load K_prior for n_b batches with one batched indirect dma_copy (V-style layout
+    [p_max blocks, (batch, fold, pos, d)]), transpose each [128 blocks, d] slice on the PE into PSUM
+    (one PSUM tile of up to one bank per chunk of tiles, allocated and evicted within this batch), evict to
+    k_sb [d, (batch, tile, 128)] in the logical (unbatched) tile order, then stitch k_active for the group.
+
+    Returns k_sb_group [d_head, n_b * n_tiles * p_max]. Requires s_active == 1, n_d_tiles == 1, d_head == p_max.
+    """
+    n_tiles = n_folds * atp.block_len
+    n_cols = n_b * n_folds  # index columns per DMA
+    k_nat = sbm.alloc_stack((TC.p_max, n_cols * atp.block_len * cfg.d_head), dtype=k_dtype, buffer=nl.sbuf)
+    idx_start = i_b0 * n_folds
+    nisa.dma_copy(
+        dst=k_nat,
+        src=bufs.k_prior_reshaped.ap(
+            [
+                [atp.block_len * cfg.d_head, TC.p_max * n_cols],
+                [1, atp.block_len * cfg.d_head],
+            ],
+            offset=0,
+            vector_offset=(idx_table).slice(dim=1, start=idx_start, end=idx_start + n_cols),
+            indirect_dim=0,
+        ),
+        oob_mode=nisa.oob_mode.error,
+        name=f"cr17_ktpe_k_prior_load_b{i_b0}_bt{btc.batch_tile_idx}",
+    )
+    k_grp = sbm.alloc_stack((cfg.d_head, n_b * n_tiles * TC.p_max), dtype=k_dtype, buffer=nl.sbuf, align=32)
+    tiles_per_bank = max(1, TC.psum_f_max_bytes // (TC.p_max * sizeinbytes(k_dtype)))
+    for g in range(n_b):
+        for t0 in range(0, n_tiles, tiles_per_bank):
+            nt = min(tiles_per_bank, n_tiles - t0)
+            tp_psum = nl.ndarray((cfg.d_head, nt * TC.p_max), dtype=k_dtype, buffer=nl.psum)
+            for t in range(nt):
+                src_off = (g * n_tiles + t0 + t) * cfg.d_head
+                nisa.nc_transpose(
+                    tp_psum[:, t * TC.p_max : (t + 1) * TC.p_max], k_nat[:, src_off : src_off + cfg.d_head]
+                )
+            dst_off = (g * n_tiles + t0) * TC.p_max
+            # balance PSUM evictions across Vector / Scalar (one bank chunk per eviction)
+            engine = nisa.vector_engine if ((i_b0 + g) + t0 // tiles_per_bank) % 2 == 0 else nisa.scalar_engine
+            nisa.tensor_copy(k_grp[:, dst_off : dst_off + nt * TC.p_max], tp_psum, engine=engine)
+    # k_active: last token of the last tile (fold n_folds-1, block slot p_max-1, pos block_len-1) of every batch
+    b0 = btc.global_batch_offset + i_b0
+    ncols_b = n_tiles * TC.p_max
+    dst = (k_grp).reshape_dim(1, [n_b, ncols_b]).slice(2, start=ncols_b - 1, end=ncols_b)
+    src = (bufs.k_active_sb).slice(1, start=b0, end=b0 + n_b).expand_dim(2)
+    nisa.tensor_copy(dst=dst, src=src)
+    return k_grp
+
+
+def _cr17_skip_index_table(bufs, total_cols, TC, sbm):
+    """CR17 'kvskip': uint32 gather-index table in which every inactive slot (negative in the signed table) holds an
+    out-of-bounds row index (the KV pool row count), for oob_mode.skip. Active slots are unchanged."""
+    n_rows = max(bufs.k_prior_reshaped.shape[0], bufs.v_prior_reshaped.shape[0])
+    tbl = sbm.alloc_stack((TC.p_max, total_cols), dtype=nl.uint32, buffer=nl.sbuf, align=32)
+    nisa.tensor_copy(tbl, bufs.active_blocks_sb_u32, engine=nisa.vector_engine)
+    sbm.open_scope()
+    inactive = sbm.alloc_stack((TC.p_max, total_cols), dtype=nl.uint8, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=inactive, data=bufs.active_blocks_sb, op0=nl.less, operand0=0)
+    oob = sbm.alloc_stack((TC.p_max, total_cols), dtype=nl.uint32, buffer=nl.sbuf)
+    nisa.iota(dst=oob, pattern=[[0, total_cols]], offset=n_rows, channel_multiplier=0)
+    nisa.tensor_copy_predicated(dst=tbl, src=oob, predicate=inactive)
+    sbm.close_scope()
+    return tbl
 
 
 def _cr17_stitch_v_active_group(v_sb_shared, bufs, atp, cfg, TC, btc, i_b0, n_b, fa_tile_n_sprior, num_folds_this_tile):
