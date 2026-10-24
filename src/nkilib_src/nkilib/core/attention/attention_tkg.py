@@ -76,6 +76,9 @@ INACTIVE_BLOCK_IDX = np.int32(-1)
 #   evict  : WRONG results on trn2 (PSUM bank sharing across batches; bit-identical in the simulator).
 #   kcap64 / kcap128 : coarser K gather, 31-38 % slower.   ktpe : K via dma_copy + PE transpose, 5-10 % slower.
 #   vbuf / vskip     : persistent V buffers (+ oob skip on V); within -2..-7 % / neutral, not enabled by default.
+#   fp8st  : 'stitch' for the packed FP8 KV path (fp8_packed): one k_active copy into the packed parity lane and
+#            one v_active DMA per DMA-batch group. Simulator bit-exact vs the per-sequence stitch; not HW-verified.
+#            (fp8_packed already keeps the K dma_transpose gather at block_len 4, so it needs no 'dt4'.)
 # Refused always: kskip / kvskip (oob skip on the K dma_transpose gather HANGS the trn2 device).
 # All flags apply only where _cr17_gate() holds (block KV, 2-byte KV, gen3, d_head 128, s_active 1,
 # unswapped QK, no row tiling, auto allocation, single NC on s_prior, bs_per_nc >= 32).
@@ -83,7 +86,7 @@ _CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "dt4+stitch").strip().lowe
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
 _CR17_SUPPORTED = ("stitch", "dt4")
 for _f in _CR17_FLAGS:
-    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip", "vbuf", "dt4"):
+    if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip", "vbuf", "dt4", "fp8st"):
         raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
     if _f in ("kskip", "kvskip"):
         raise ValueError(
@@ -92,7 +95,7 @@ for _f in _CR17_FLAGS:
     if _f not in _CR17_SUPPORTED and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
         raise ValueError(
             f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled ('evict' gives wrong results on trn2; "
-            "'kcap64'/'kcap128'/'ktpe' are slower; 'vbuf'/'vskip' are not enabled by default). "
+            "'kcap64'/'kcap128'/'ktpe' are slower; 'vbuf'/'vskip'/'fp8st' are not enabled by default). "
             "Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only to reproduce the A/B."
         )
 _CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
@@ -117,6 +120,7 @@ _CR17_VBUF = "vbuf" in _CR17_FLAGS
 # at bs_attn 51 (1043 vs 758 us measured). Only at large folded batch (the fallback's "too few batches" reason
 # does not apply), d_head 128, s_active 1, 2-byte KV, gen3.
 _CR17_DT4 = "dt4" in _CR17_FLAGS
+_CR17_FP8ST = "fp8st" in _CR17_FLAGS
 _CR17_VSKIP_NBUF = int(os.environ.get("NKILIB_CR17_VBUF_N", "4"))
 _CR17_EVICT_GROUP = 32  # batches per shared PSUM tile (QK and PV)
 _CR17_MIN_BS = 32
@@ -2713,8 +2717,30 @@ def _compute_qk_matmul(
             and k_dma_batch_n_batches > 1
             and atp.bs % k_dma_batch_n_batches == 0
         )
+        _cr17_k_group_stitch_fp8 = (
+            _CR17_FP8ST
+            and _cr17_gate_fp8(atp, cfg, sbm)
+            and k_dma_batch_n_batches > 1
+            and atp.bs % k_dma_batch_n_batches == 0
+        )
         if _cr17_ktpe_n_b > 1:
             pass
+        elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile and _cr17_k_group_stitch_fp8:
+            if i_b % k_dma_batch_n_batches == 0:
+                _cr17_stitch_k_active_group_fp8(
+                    k_sb,
+                    bufs,
+                    atp,
+                    cfg,
+                    TC,
+                    btc,
+                    i_b,
+                    k_dma_batch_n_batches,
+                    num_folds_this_tile,
+                    k_dma_batch_n_folds,
+                    k_block_len_row_tiled,
+                    _k_sb_dtype,
+                )
         elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile and _cr17_k_group_stitch:
             if i_b % k_dma_batch_n_batches == 0:
                 _cr17_stitch_k_active_group(
@@ -4632,8 +4658,7 @@ def _compute_pv_matmul_and_store(
 
         # Load V_active to the last portion if needed (only on last FA tile)
         _cr17_v_group_stitch = (
-            _CR17_STITCH
-            and _cr17_gate(atp, cfg, sbm)
+            ((_CR17_STITCH and _cr17_gate(atp, cfg, sbm)) or (_CR17_FP8ST and _cr17_gate_fp8(atp, cfg, sbm)))
             and v_dma_batch_n_batches > 1
             and atp.bs % v_dma_batch_n_batches == 0
         )
@@ -6167,6 +6192,77 @@ def _cr17_gate(atp, cfg, sbm) -> bool:
         and not atp.use_fa
         and atp.bs >= _CR17_MIN_BS
     )
+
+
+def _cr17_gate_fp8(atp, cfg, sbm) -> bool:
+    """_cr17_gate for the packed FP8 KV path: the same shape conditions, with packed FP8 instead of 2-byte KV."""
+    return (
+        len(_CR17_FLAGS) > 0
+        and atp.is_block_kv
+        and atp.use_dma_transpose
+        and atp.is_fp8_kv
+        and cfg.fp8_packed
+        and nisa.get_nc_version() == nisa.nc_version.gen3
+        and cfg.d_head == 128
+        and atp.n_d_tiles == 1
+        and cfg.s_active == 1
+        and not atp.qk_swapped
+        and atp.qk_row_tile_factor == 1
+        and sbm.is_auto_alloc()
+        and atp.sprior_n_prgs == 1
+        and not atp.use_fa
+        and atp.bs >= _CR17_MIN_BS
+        and atp.block_len % 2 == 0
+    )
+
+
+def _cr17_stitch_k_active_group_fp8(
+    k_sb,
+    bufs,
+    atp,
+    cfg,
+    TC,
+    btc,
+    i_b0,
+    n_b,
+    num_folds_this_tile,
+    k_dma_batch_n_folds,
+    k_block_len_row_tiled,
+    k_fp8_dtype,
+):
+    """CR17 'fp8st': write k_active for n_b batches of one batched-DMA group with a single copy (packed FP8 K).
+
+    k_sb is bf16 [d_head, n_tiles * p_max]; each bf16 column holds a token pair (lane 0 = even, lane 1 = odd
+    position). Viewed as fp8 it is [d_head, n_tiles, p_max, 2]. Requires s_active == 1, qk_row_tile_factor == 1,
+    n_d_tiles == 1, all folds in one DMA group. The active token sits in block slot p_max - 1 at in-block position
+    block_len - 1, i.e. bf16 row (block_len - 1) // 2 = k_block_len_row_tiled - 1, lane 1. Its tile column for
+    batch g follows _k_tile_physical_index: pos * (n_folds * n_b) + g * n_folds + (n_folds - 1), the same as
+    _cr17_stitch_k_active_group with the packed row count. Equals n_b calls of the fp8_packed branch of
+    _stitch_k_active.
+    """
+    kernel_assert(k_dma_batch_n_folds == num_folds_this_tile, "CR17 fp8st: expected all folds batched")
+    kernel_assert(atp.block_len % 2 == 0, "CR17 fp8st: packed K needs an even block_len")
+    pos_in_fold = (atp.block_len - 1) // 2
+    kernel_assert(pos_in_fold == k_block_len_row_tiled - 1, "CR17 fp8st: unexpected packed row count")
+    n_folds = k_dma_batch_n_folds
+    first_tile = pos_in_fold * n_folds * n_b + (n_folds - 1)
+    n_tiles = k_sb.shape[1] // TC.p_max
+    dst = (
+        (k_sb)
+        .view(k_fp8_dtype)
+        .reshape_dim(1, [n_tiles, TC.p_max * 2])
+        .reshape_dim(2, [TC.p_max, 2])
+        .slice(1, start=first_tile, end=first_tile + (n_b - 1) * n_folds + 1, step=n_folds)
+        .slice(2, start=TC.p_max - 1, end=TC.p_max)
+        .slice(3, start=1, end=2)
+    )
+    src = (
+        (bufs.k_active_sb)
+        .slice(1, start=btc.global_batch_offset + i_b0, end=btc.global_batch_offset + i_b0 + n_b)
+        .expand_dim(2)
+        .expand_dim(3)
+    )
+    nisa.tensor_copy(dst=dst, src=src)
 
 
 def _cr17_stitch_k_active_group(k_sb, bufs, atp, cfg, TC, btc, i_b0, n_b, num_folds_this_tile, k_dma_batch_n_folds):
