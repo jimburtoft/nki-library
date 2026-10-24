@@ -65,28 +65,35 @@ _MAX_FLOAT32 = float(np.finfo(np.float32).max)
 INACTIVE_BLOCK_IDX = np.int32(-1)
 
 # Batched block-KV decode switch (read once at import / trace time).
-# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "stitch" (measured on trn2: -19 to -24 % per
-# attention_tkg call at bs 32-64, output identical); "stock" restores the original paths.
-# Only "stitch" is recommended: "evict" gives WRONG results on hardware (PSUM bank sharing across batches,
-# not visible in the simulator) and "kcap64/kcap128" are 31-38 % slower on trn2.
-#   kcap64 / kcap128 : raise the trn2 (gen3) K dma_transpose batching cap from 32 to 64 / 128.
-#   stitch           : stitch k_active / v_active for a whole DMA-batch group with one copy / one DMA
-#                      instead of one per batch.
-#   evict            : share one PSUM tile across a group of batches for the QK and PV matmuls so the
-#                      PSUM -> SBUF evictions run once per group instead of once per batch.
+# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "dt4+stitch" (HW-verified on trn2, outputs identical
+# to the original paths); "stock" restores the original paths. Supported flags:
+#   stitch : write the active token's K / V once per DMA-batch group instead of once per sequence
+#            (attention_tkg -19 to -24 % at bs 32-64, bucket 1024).
+#   dt4    : keep the K dma_transpose gather at resized block_len 4 (decode bucket 512 with 32-token blocks)
+#            instead of the PE-transpose fallback (-54 to -57 % at bucket 512); this is what makes a 512 decode
+#            context bucket faster than 1024.
+# Experimental flags (A/B reproduction only; need NKILIB_CR17_ALLOW_EXPERIMENTAL=1):
+#   evict  : WRONG results on trn2 (PSUM bank sharing across batches; bit-identical in the simulator).
+#   kcap64 / kcap128 : coarser K gather, 31-38 % slower.   ktpe : K via dma_copy + PE transpose, 5-10 % slower.
+#   vbuf / vskip     : persistent V buffers (+ oob skip on V); within -2..-7 % / neutral, not enabled by default.
+# Refused always: kskip / kvskip (oob skip on the K dma_transpose gather HANGS the trn2 device).
 # All flags apply only where _cr17_gate() holds (block KV, 2-byte KV, gen3, d_head 128, s_active 1,
 # unswapped QK, no row tiling, auto allocation, single NC on s_prior, bs_per_nc >= 32).
-_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "stitch").strip().lower()
+_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "dt4+stitch").strip().lower()
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
+_CR17_SUPPORTED = ("stitch", "dt4")
 for _f in _CR17_FLAGS:
     if _f not in ("kcap64", "kcap128", "stitch", "evict", "ktpe", "kvskip", "kskip", "vskip", "vbuf", "dt4"):
         raise ValueError(f"Unknown NKILIB_CR17_VARIANT flag {_f!r} in {_CR17_VARIANT!r}")
-    if _f != "stitch" and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
+    if _f in ("kskip", "kvskip"):
         raise ValueError(
-            f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled: 'evict' gives wrong results on trn2, "
-            "'kcap64'/'kcap128'/'ktpe' are slower, 'kskip'/'kvskip' HANG the trn2 device (oob skip on the K "
-            "dma_transpose gather), 'vskip' (2 buffers) is slower, 'vbuf'/'dt4' are not HW-verified. Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only "
-            "to reproduce / run the A/B."
+            f"NKILIB_CR17_VARIANT flag {_f!r} is refused: oob skip on the K dma_transpose gather hangs trn2."
+        )
+    if _f not in _CR17_SUPPORTED and os.environ.get("NKILIB_CR17_ALLOW_EXPERIMENTAL") != "1":
+        raise ValueError(
+            f"NKILIB_CR17_VARIANT flag {_f!r} is experimental and disabled ('evict' gives wrong results on trn2; "
+            "'kcap64'/'kcap128'/'ktpe' are slower; 'vbuf'/'vskip' are not enabled by default). "
+            "Set NKILIB_CR17_ALLOW_EXPERIMENTAL=1 only to reproduce the A/B."
         )
 _CR17_KCAP = 128 if "kcap128" in _CR17_FLAGS else (64 if "kcap64" in _CR17_FLAGS else 0)
 _CR17_STITCH = "stitch" in _CR17_FLAGS
@@ -2378,9 +2385,7 @@ def _compute_qk_matmul(
         and num_folds_this_tile * atp.block_len * TC.p_max == fa_tile_s_prior
         and is_last_fa_tile
     ):
-        _kf, _kb = _compute_dma_batch_params(
-            num_folds_this_tile, atp.bs, atp.block_len, cap=_CR17_KTPE_CAP, sbm=sbm
-        )
+        _kf, _kb = _compute_dma_batch_params(num_folds_this_tile, atp.bs, atp.block_len, cap=_CR17_KTPE_CAP, sbm=sbm)
         if _kf == num_folds_this_tile and _kb > 1 and atp.bs % _kb == 0:
             _cr17_ktpe_n_b = _kb
             _cr17_ktpe_n_tiles = num_folds_this_tile * atp.block_len
@@ -2407,7 +2412,16 @@ def _compute_qk_matmul(
             _g = i_b % _cr17_ktpe_n_b
             if _g == 0:
                 k_sb_shared = _cr17_ktpe_load_group(
-                    bufs, atp, cfg, TC, sbm, btc, i_b, _cr17_ktpe_n_b, num_folds_this_tile, _cr17_ktpe_idx,
+                    bufs,
+                    atp,
+                    cfg,
+                    TC,
+                    sbm,
+                    btc,
+                    i_b,
+                    _cr17_ktpe_n_b,
+                    num_folds_this_tile,
+                    _cr17_ktpe_idx,
                     _k_sb_dtype,
                 )
             _ncols = _cr17_ktpe_n_tiles * TC.p_max
@@ -2475,9 +2489,9 @@ def _compute_qk_matmul(
                     k_dma_batch_size = k_dma_batch_n_folds * k_dma_batch_n_batches
                     idx_start = i_b * num_folds_this_tile + i_fold_rel
 
-                    blks_u32 = (
-                        bufs.active_blocks_sb_u32 if _cr17_kskip_tbl is None else _cr17_kskip_tbl
-                    ).slice(dim=1, start=idx_start, end=idx_start + k_dma_batch_size)
+                    blks_u32 = (bufs.active_blocks_sb_u32 if _cr17_kskip_tbl is None else _cr17_kskip_tbl).slice(
+                        dim=1, start=idx_start, end=idx_start + k_dma_batch_size
+                    )
 
                     dst_start = i_fold_rel * k_block_len_row_tiled * TC.p_max if k_dma_batch_n_batches == 1 else 0
                     dst_end = dst_start + k_dma_batch_size * k_block_len_row_tiled * TC.p_max
@@ -4626,7 +4640,15 @@ def _compute_pv_matmul_and_store(
         if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile and _cr17_v_group_stitch:
             if i_b % v_dma_batch_n_batches == 0:
                 _cr17_stitch_v_active_group(
-                    v_sb_shared, bufs, atp, cfg, TC, btc, i_b, v_dma_batch_n_batches, fa_tile_n_sprior,
+                    v_sb_shared,
+                    bufs,
+                    atp,
+                    cfg,
+                    TC,
+                    btc,
+                    i_b,
+                    v_dma_batch_n_batches,
+                    fa_tile_n_sprior,
                     num_folds_this_tile,
                 )
         elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
@@ -4822,9 +4844,7 @@ def _compute_pv_matmul_and_store(
                 if atp.use_online_softmax:
                     nisa.tensor_copy(ev_view, pv_psum_grp)
                 else:
-                    recip_view = bufs.exp_sum_recip[
-                        : cfg.d_head, g0 * atp.s_active_qh : (g0 + g_n) * atp.s_active_qh
-                    ]
+                    recip_view = bufs.exp_sum_recip[: cfg.d_head, g0 * atp.s_active_qh : (g0 + g_n) * atp.s_active_qh]
                     nisa.tensor_tensor(ev_view, pv_psum_grp, recip_view, op=nl.multiply)
             sbm.increment_section()
             continue
@@ -6175,6 +6195,7 @@ def _cr17_stitch_k_active_group(k_sb, bufs, atp, cfg, TC, btc, i_b0, n_b, num_fo
     )
     nisa.tensor_copy(dst=dst, src=src)
 
+
 def _cr17_ktpe_load_group(bufs, atp, cfg, TC, sbm, btc, i_b0, n_b, n_folds, idx_table, k_dtype):
     """CR17 'ktpe': load K_prior for n_b batches with one batched indirect dma_copy (V-style layout
     [p_max blocks, (batch, fold, pos, d)]), transpose each [128 blocks, d] slice on the PE into PSUM
@@ -6209,7 +6230,9 @@ def _cr17_ktpe_load_group(bufs, atp, cfg, TC, sbm, btc, i_b0, n_b, n_folds, idx_
             tp_psum = nl.ndarray((cfg.d_head, nt * TC.p_max), dtype=k_dtype, buffer=nl.psum)
             for t in range(nt):
                 src_off = (g * n_tiles + t0 + t) * cfg.d_head
-                nisa.nc_transpose(tp_psum[:, t * TC.p_max : (t + 1) * TC.p_max], k_nat[:, src_off : src_off + cfg.d_head])
+                nisa.nc_transpose(
+                    tp_psum[:, t * TC.p_max : (t + 1) * TC.p_max], k_nat[:, src_off : src_off + cfg.d_head]
+                )
             dst_off = (g * n_tiles + t0) * TC.p_max
             # balance PSUM evictions across Vector / Scalar (one bank chunk per eviction)
             engine = nisa.vector_engine if ((i_b0 + g) + t0 // tiles_per_bank) % 2 == 0 else nisa.scalar_engine
