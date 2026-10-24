@@ -14,6 +14,7 @@
 
 """This file contains high-performance MoE kernels implementing blockwise matrix multiplication with sharding on the intermediate dimension."""
 
+import os
 from typing import Any, Optional
 
 import nki
@@ -44,6 +45,16 @@ MAX_BLOCK_TILE_SIZE = 1024
 FUSE_GATE_WEIGHT_SIZE = 4096 * 1024
 P_MAX = nl.tile_size.pmax
 F_MAX = nl.tile_size.psum_fmax
+
+# Per-channel FP8 weights are used as FP8 operands of nc_matmul (FP8 x BF16, FP32 accumulation),
+# with the per-channel scale applied to the result. This avoids a copy of every weight tile to BF16
+# before each matmul. Set NKILIB_FP8_DIRECT_MATMUL=0 to copy the weights to BF16 first instead.
+# A further speed-up is possible with perf_mode="double_row" (FP8 x FP8 at twice the BF16 matmul
+# rate), which also needs the activations in FP8 with their own scale.
+_FP8_DIRECT_MATMUL = os.environ.get("NKILIB_FP8_DIRECT_MATMUL", "1") != "0"
+# Marker for callers: per-channel FP8 weights feed nc_matmul directly.
+FP8_DIRECT_MATMUL = _FP8_DIRECT_MATMUL
+
 # Block quant tile size: scales are organized as 256x256 blocks along (H, I_TP).
 BLOCK_QUANT_SIZE = 256
 
@@ -1092,10 +1103,10 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
         block_hidden_states, dims.H, dims.B, cfg.compute_dtype, is_quant=cfg.is_block_quant
     )
 
-    # Cast transposed hidden states to FP8 only for block-quant, which still uses double_row.
-    # Per-channel quant falls back to mainline-style bf16-upcast + standard matmul (see below)
-    # because the double_row .ap() pattern produces a partition/free-product mismatch that the
-    # MLIR tracer rejects (and the parser frontend silently miscompiles for per-channel scales).
+    # Cast transposed hidden states to FP8 only for block-quant, which uses double_row.
+    # Per-channel quant keeps BF16 activations and uses the FP8 weights directly in a standard
+    # nc_matmul (see compute_gate_and_up_projections_shard_on_intermediate); double_row for
+    # per-channel is a possible future speed-up.
     if cfg.is_quant and cfg.is_block_quant:
         h_outer_tc = div_ceil(dims.H, PSUM_SIZE)
         h_inner_tc = PSUM_SIZE // TILE_SIZE
@@ -1432,19 +1443,16 @@ def compute_gate_and_up_projections_shard_on_intermediate(
                 else:
                     # Per-channel quant or non-quant: standard nc_matmul + psum auto-accumulation.
                     # block_hidden_states_T is list[h_outer][h_inner] of 3D tiles for both paths.
-                    # For per-channel FP8 quant we upcast the FP8 weights to bf16 first (matching mainline);
-                    # the alternate FP8xFP8 + perf_mode="double_row" path produces an MLIR
-                    # partition/free-product mismatch that silently miscompiles in the parser frontend.
+                    # Per-channel FP8 weights are FP8 operands of the matmul (FP8 x BF16); the scale is
+                    # applied when PSUM is drained. NKILIB_FP8_DIRECT_MATMUL=0 copies them to BF16 first.
                     for h_inner_idx in range(h_inner_tripcount):
                         # Skip H tiles past the actual tensor extent (when H is not a multiple of PSUM_SIZE).
                         if h_outer_idx * h_inner_tripcount + h_inner_idx >= linearized_h_tripcount:
                             continue
                         for b_psum_idx in range(N_PSUM_TILE):
-                            if cfg.is_quant:
-                                # Mainline-style: upcast FP8 weights to bf16 and do bf16xbf16 matmul.
-                                # Per mainline 21106510, the upcast dst must be 2D (matches the 2D source after
-                                # scalar gate_or_up indexing); the 3D (TILE_SIZE, 1, num_i_tile) form caused
-                                # all-zero output on some configs.
+                            if cfg.is_quant and not _FP8_DIRECT_MATMUL:
+                                # Copy the FP8 weights to a 2D BF16 tile (same shape as the 2D source after
+                                # scalar gate_or_up indexing) and do a BF16 x BF16 matmul.
                                 if cfg.fuse_gate_and_up_load:
                                     gup_w_upcasted = nl.ndarray(
                                         (TILE_SIZE, num_i_tile), dtype=nl.bfloat16, buffer=nl.sbuf
@@ -2218,7 +2226,7 @@ def compute_down_proj_shard_on_intermediate(
                     # Per-channel quant or non-quant: auto-accumulate in psum across I tiles
                     for i_i in range(GUP_N_TILES):
                         num_i_elems = min(TILE_SIZE, dims.I_TP_sharded - TILE_SIZE * i_i)
-                        if cfg.is_quant:
+                        if cfg.is_quant and not _FP8_DIRECT_MATMUL:
                             dp_weights_upcasted = nl.ndarray(
                                 (num_i_elems, num_h_elems), dtype=nl.bfloat16, buffer=nl.sbuf
                             )
