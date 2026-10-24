@@ -5,14 +5,21 @@ This branch is the public **`2.33`** tag of `aws-neuron/nki-library` (`726c501`)
 | commit | kernel | change | measured on trn2 (SDK 2.33 HW) |
 |---|---|---|---|
 | `attention_block_tkg` / `qkv_tkg` | At B·S == 1 the QKV weight is stationary and the output is d-major. That removes 8 serial Vector PSUM adds and 6 head transposes, and fuses Q\|K RMSNorm and a single RoPE. | kernel **−10.0 % (LNC2) / −12.3 % (LNC1)** at a 2048-hidden decoder shape |
-| `attention_tkg` | At batched block-KV decode, the active token's K/V are written once per DMA-batch group instead of once per sequence: one copy and one DMA per group. Gate: trn2, block KV with DMA-transpose K load, bf16 KV, d_head 128, s_active 1, ≥ 32 batches per core. `NKILIB_CR17_VARIANT=stock` turns it off. | kernel **−19 to −24 %** at 32–64 sequences, output identical |
+| `attention_tkg` | Batched block-KV decode (trn2, bf16, d_head 128, s_active 1, ≥ 32 batches/core): **stitch** writes the active token's K/V once per DMA-batch group, not per sequence. **dt4** keeps the fast K `dma_transpose` gather at the 512 decode bucket (resized block_len 4) instead of falling back to the PE path. Default `NKILIB_CR17_VARIANT=dt4+stitch`; `stock` turns both off. | kernel **−19 to −24 %** at bucket 1024, **−54 to −57 %** at bucket 512; output identical |
 | `mlp_tkg` | At T == 1 with gate/up column tiling off, the down projection runs in column-tiling mode: 24 matmuls instead of 96 strided ones, plus one contiguous output store. | kernel **−6.1 to −7.5 % (LNC2)**, neutral at LNC1, output bit-identical |
 
 - **Scope:** every other shape and caller runs the existing code. The gates are in the commit messages.
 - **Tests:** stock vs patched, the nkilib suites on SDK 2.33 hardware gave identical pass/fail. The new tests are `test_attn_blk_fast` (2 configs), `test_mlp_tkg_single_token_down_column_tiling` (5 cases) and `test/unit/nkilib/core/mlp/test_mlp_tkg_single_token_gate.py`.
 - **Qwen3-ASR single stream** (TP4, LNC2, 30 s audio): E2E p50 360 → 342 ms with the attention change. The mlp change adds a further −9 ms.
-- **Qwen3-ASR throughput** (TP1, 30 s): the batched-decode change gives +2.6 % at 4 replicas (LNC2) and +3.4 % at 8 replicas (LNC1). Decode ITL at 51 running goes from 44.0 to 41.4 ms. WER is unchanged.
-- **Variants evaluated and rejected** for the batched-decode change: sharing one PSUM eviction across 32 batches (`evict`) gives **wrong results on hardware**, though it is bit-identical in the simulator. A coarser K gather on trn2 (`kcap64`/`kcap128`) is 31–38 % slower. Both stay behind `NKILIB_CR17_ALLOW_EXPERIMENTAL=1` for reproduction only.
+- **Qwen3-ASR throughput** (TP1, 30 s, with `decode_context_length_buckets [512]` in vllm-neuron): **1,712–1,722 RTFx** at 8 replicas (LNC1) against 1,517–1,526 for stock nkilib, and **1,508–1,516** at 4 replicas (LNC2) against 1,366–1,383. Decode ITL at 51 running goes 44.0 → 34.6 ms. WER 6.01 %.
+  - stitch alone at bucket 1024: +2.6 % / +3.4 %.
+  - dt4 with the 512 bucket: a further +5.7 % / +8.4 %.
+- **Variants evaluated and rejected** for the batched-decode change. These stay behind `NKILIB_CR17_ALLOW_EXPERIMENTAL=1` for reproduction only:
+  - `evict` (one PSUM eviction per 32 batches) gives **wrong results on hardware**, though it is bit-identical in the simulator.
+  - `kcap64`/`kcap128` (coarser K gather) is 31–38 % slower.
+  - `ktpe` (K via dma_copy + PE transpose) is 5–10 % slower.
+  - `vbuf` and `vskip` (persistent V buffers, and oob skip on the V padding) are neutral to −7 %, so they are not enabled by default.
+- **`kskip`/`kvskip`** (oob skip on the K gather) **hang the trn2 device** and are refused.
 
 ## Use
 nkilib ships inside the `nki` wheel as the top-level package `nkilib`. To use this branch, put `src/nkilib_src` first on `PYTHONPATH`. The bundled copy is then shadowed, and nothing needs to be reinstalled:
