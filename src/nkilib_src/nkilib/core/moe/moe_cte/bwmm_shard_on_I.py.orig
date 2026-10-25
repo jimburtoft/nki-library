@@ -54,6 +54,10 @@ F_MAX = nl.tile_size.psum_fmax
 _FP8_DIRECT_MATMUL = os.environ.get("NKILIB_FP8_DIRECT_MATMUL", "1") != "0"
 # Marker for callers: per-channel FP8 weights feed nc_matmul directly.
 FP8_DIRECT_MATMUL = _FP8_DIRECT_MATMUL
+# Per-channel FP8 down-proj scale: broadcast across partitions in the DMA (stride-0 partition dim) instead of
+# Vector stream shuffles. Set NKILIB_DOWN_SCALE_DMA_BCAST=0 to restore the shuffles.
+_DOWN_SCALE_DMA_BCAST = os.environ.get("NKILIB_DOWN_SCALE_DMA_BCAST", "1") != "0"
+DOWN_SCALE_DMA_BCAST = _DOWN_SCALE_DMA_BCAST
 
 # Block quant tile size: scales are organized as 256x256 blocks along (H, I_TP).
 BLOCK_QUANT_SIZE = 256
@@ -2125,23 +2129,36 @@ def compute_down_proj_shard_on_intermediate(
 
                     elem_offset = PSUM_SIZE * h_tile_idx + H_tile_size * H_tile1024_idx
 
-                    nisa.dma_copy(
-                        dst=down_scale[0:1, h_tile_idx, 0:num_psum_elems],
-                        src=inps.down_proj_scale.ap(
-                            pattern=[[dims.H, 1], [dims.H, 1], [1, num_psum_elems]],
-                            offset=elem_offset,
-                            scalar_offset=block_expert,
-                            indirect_dim=0,
-                        ),
-                    )
-                    for channel_bank_idx in range(4):
-                        nisa.nc_stream_shuffle(
-                            src=down_scale[0:1, h_tile_idx, :],
-                            dst=down_scale[
-                                nl.ds(DVE_CHANNELS_PER_BANK * channel_bank_idx, DVE_CHANNELS_PER_BANK), h_tile_idx, :
-                            ],
-                            shuffle_mask=[0] * DVE_CHANNELS_PER_BANK,
+                    if _DOWN_SCALE_DMA_BCAST:
+                        # Broadcast the [1, H] scale row to all TILE_SIZE partitions in the DMA itself
+                        # (partition stride 0) instead of 4 Vector-engine stream shuffles per H tile.
+                        nisa.dma_copy(
+                            dst=down_scale[0:TILE_SIZE, h_tile_idx, 0:num_psum_elems],
+                            src=inps.down_proj_scale.ap(
+                                pattern=[[0, TILE_SIZE], [dims.H, 1], [1, num_psum_elems]],
+                                offset=elem_offset,
+                                scalar_offset=block_expert,
+                                indirect_dim=0,
+                            ),
                         )
+                    else:
+                        nisa.dma_copy(
+                            dst=down_scale[0:1, h_tile_idx, 0:num_psum_elems],
+                            src=inps.down_proj_scale.ap(
+                                pattern=[[dims.H, 1], [dims.H, 1], [1, num_psum_elems]],
+                                offset=elem_offset,
+                                scalar_offset=block_expert,
+                                indirect_dim=0,
+                            ),
+                        )
+                        for channel_bank_idx in range(4):
+                            nisa.nc_stream_shuffle(
+                                src=down_scale[0:1, h_tile_idx, :],
+                                dst=down_scale[
+                                    nl.ds(DVE_CHANNELS_PER_BANK * channel_bank_idx, DVE_CHANNELS_PER_BANK), h_tile_idx, :
+                                ],
+                                shuffle_mask=[0] * DVE_CHANNELS_PER_BANK,
+                            )
                 dp_block_scale = None
 
         dp_weights = load_down_proj_weight_shard_intermediate_H_tile(

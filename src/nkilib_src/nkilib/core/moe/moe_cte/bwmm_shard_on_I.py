@@ -58,6 +58,11 @@ FP8_DIRECT_MATMUL = _FP8_DIRECT_MATMUL
 # Vector stream shuffles. Set NKILIB_DOWN_SCALE_DMA_BCAST=0 to restore the shuffles.
 _DOWN_SCALE_DMA_BCAST = os.environ.get("NKILIB_DOWN_SCALE_DMA_BCAST", "1") != "0"
 DOWN_SCALE_DMA_BCAST = _DOWN_SCALE_DMA_BCAST
+# Per-channel FP8: load all gate/up scales of a block with one DMA, and the down scale of each 1024-wide H tile with
+# one broadcast DMA, instead of one small DMA per 128-row I tile / 512-wide PSUM tile. NKILIB_FP8_SCALE_COALESCE=0
+# restores the per-tile loads.
+_FP8_SCALE_COALESCE = os.environ.get("NKILIB_FP8_SCALE_COALESCE", "1") != "0"
+FP8_SCALE_COALESCE = _FP8_SCALE_COALESCE
 
 # Block quant tile size: scales are organized as 256x256 blocks along (H, I_TP).
 BLOCK_QUANT_SIZE = 256
@@ -1012,16 +1017,34 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
             gup_block_scale = None
         else:
             # Per-channel quant: scale shape [E, 1, 2*I_TP]
-            gup_scale = []
-            for _ in range(dims.GUP_N_TILES):
-                tmp = []
-                for _ in range(2):
-                    tmp.append(nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf))
-                gup_scale.append(tmp)
-
             gate_up_proj_scale_reshaped = inps.gate_up_proj_scale.reshape((dims.E, 2, dims.I_TP))
+            _gu_coalesce = _FP8_SCALE_COALESCE and dims.I_TP_sharded == TILE_SIZE * dims.GUP_N_TILES
+            gup_scale = []
+            if _gu_coalesce:
+                # One DMA: tile[p, 2 * t + g] = scale[expert, g, shard_offset + 128 * t + p]
+                gup_scale_tile = nl.ndarray((TILE_SIZE, 2 * dims.GUP_N_TILES), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=gup_scale_tile[0:TILE_SIZE, 0 : 2 * dims.GUP_N_TILES],
+                    src=gate_up_proj_scale_reshaped.ap(
+                        pattern=[[1, TILE_SIZE], [TILE_SIZE, dims.GUP_N_TILES], [dims.I_TP, 2]],
+                        offset=shard_id * dims.I_TP_sharded,
+                        scalar_offset=block_expert,
+                        indirect_dim=0,
+                    ),
+                    oob_mode=nisa.oob_mode.error,
+                )
+                for t in range(dims.GUP_N_TILES):
+                    gup_scale.append(
+                        [gup_scale_tile[0:TILE_SIZE, 2 * t : 2 * t + 1], gup_scale_tile[0:TILE_SIZE, 2 * t + 1 : 2 * t + 2]]
+                    )
+            else:
+                for _ in range(dims.GUP_N_TILES):
+                    tmp = []
+                    for _ in range(2):
+                        tmp.append(nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf))
+                    gup_scale.append(tmp)
 
-            for gup_tile_idx in range(dims.GUP_N_TILES):
+            for gup_tile_idx in range(dims.GUP_N_TILES if not _gu_coalesce else 0):
                 for gate_or_up in range(2):
                     if cfg.skip_gate_proj and gate_or_up == 0:
                         continue
@@ -2124,7 +2147,21 @@ def compute_down_proj_shard_on_intermediate(
                 # Per-channel: [E, 1, H]
                 down_scale = nl.ndarray((TILE_SIZE, num_h_tiles, PSUM_SIZE), dtype=nl.float32, buffer=nl.sbuf)
                 down_scale_pt = None
-                for h_tile_idx in range(num_h_tiles):
+                _dn_coalesce = (
+                    _FP8_SCALE_COALESCE and _DOWN_SCALE_DMA_BCAST and actual_H_tile_size == num_h_tiles * PSUM_SIZE
+                )
+                if _dn_coalesce:
+                    # One broadcast DMA for the whole 1024-wide H tile (partition stride 0).
+                    nisa.dma_copy(
+                        dst=down_scale[0:TILE_SIZE, 0:num_h_tiles, 0:PSUM_SIZE],
+                        src=inps.down_proj_scale.ap(
+                            pattern=[[0, TILE_SIZE], [PSUM_SIZE, num_h_tiles], [1, PSUM_SIZE]],
+                            offset=H_tile_size * H_tile1024_idx,
+                            scalar_offset=block_expert,
+                            indirect_dim=0,
+                        ),
+                    )
+                for h_tile_idx in range(num_h_tiles if not _dn_coalesce else 0):
                     num_psum_elems = min(PSUM_SIZE, dims.H - (PSUM_SIZE * h_tile_idx + H_tile_size * H_tile1024_idx))
 
                     elem_offset = PSUM_SIZE * h_tile_idx + H_tile_size * H_tile1024_idx
