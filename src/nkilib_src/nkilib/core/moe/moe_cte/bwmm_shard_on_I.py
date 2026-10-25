@@ -63,6 +63,10 @@ DOWN_SCALE_DMA_BCAST = _DOWN_SCALE_DMA_BCAST
 # restores the per-tile loads.
 _FP8_SCALE_COALESCE = os.environ.get("NKILIB_FP8_SCALE_COALESCE", "1") != "0"
 FP8_SCALE_COALESCE = _FP8_SCALE_COALESCE
+# Down-proj bias: broadcast the [1, H] row to all partitions with one DMA instead of Vector stream shuffles.
+# Applies to BF16 and FP8. NKILIB_DOWN_BIAS_DMA_BCAST=0 restores the shuffles.
+_DOWN_BIAS_DMA_BCAST = os.environ.get("NKILIB_DOWN_BIAS_DMA_BCAST", "1") != "0"
+DOWN_BIAS_DMA_BCAST = _DOWN_BIAS_DMA_BCAST
 
 # Block quant tile size: scales are organized as 256x256 blocks along (H, I_TP).
 BLOCK_QUANT_SIZE = 256
@@ -2030,21 +2034,35 @@ def compute_down_proj_shard_on_intermediate(
     if cfg.linear_bias:
         down_bias = nl.ndarray((1, dims.H), dtype=_bias_dtype, buffer=nl.sbuf)
 
-        nisa.dma_copy(
-            dst=down_bias[0:1, 0 : dims.H],
-            src=inps.down_proj_bias.ap(
-                pattern=[
-                    [dims.H, 1],  # Dim 0: stride=dims.H, count=1 row
-                    [1, dims.H],  # Dim 1: stride=1, count=dims.H (contiguous)
-                ],
-                offset=0,
-                scalar_offset=block_expert,
-                indirect_dim=0,
-            ),
-            oob_mode=nisa.oob_mode.error,
-        )
         down_bias_broadcasted = nl.ndarray((TILE_SIZE, dims.H), dtype=_bias_dtype, buffer=nl.sbuf)
-        stream_shuffle_broadcast(down_bias, down_bias_broadcasted)
+        if _DOWN_BIAS_DMA_BCAST:
+            # Broadcast the [1, H] bias row to all TILE_SIZE partitions in the DMA (partition stride 0) instead of
+            # Vector-engine stream shuffles.
+            nisa.dma_copy(
+                dst=down_bias_broadcasted[0:TILE_SIZE, 0 : dims.H],
+                src=inps.down_proj_bias.ap(
+                    pattern=[[0, TILE_SIZE], [1, dims.H]],
+                    offset=0,
+                    scalar_offset=block_expert,
+                    indirect_dim=0,
+                ),
+                oob_mode=nisa.oob_mode.error,
+            )
+        else:
+            nisa.dma_copy(
+                dst=down_bias[0:1, 0 : dims.H],
+                src=inps.down_proj_bias.ap(
+                    pattern=[
+                        [dims.H, 1],  # Dim 0: stride=dims.H, count=1 row
+                        [1, dims.H],  # Dim 1: stride=1, count=dims.H (contiguous)
+                    ],
+                    offset=0,
+                    scalar_offset=block_expert,
+                    indirect_dim=0,
+                ),
+                oob_mode=nisa.oob_mode.error,
+            )
+            stream_shuffle_broadcast(down_bias, down_bias_broadcasted)
 
     block_new_lst = []
     for b_tile_idx in range(dims.NUM_B_TILES):
