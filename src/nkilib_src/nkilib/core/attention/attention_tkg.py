@@ -65,29 +65,28 @@ _MAX_FLOAT32 = float(np.finfo(np.float32).max)
 INACTIVE_BLOCK_IDX = np.int32(-1)
 
 # Batched block-KV decode switch (read once at import / trace time).
-# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "dt4+stitch" (HW-verified on trn2, outputs identical
+# NKILIB_CR17_VARIANT is a '+'-joined list of flags. Default "dt4+stitch+fp8st" (HW-verified on trn2, outputs identical
 # to the original paths); "stock" restores the original paths. Supported flags:
 #   stitch : write the active token's K / V once per DMA-batch group instead of once per sequence
 #            (attention_tkg -19 to -24 % at bs 32-64, bucket 1024).
 #   dt4    : keep the K dma_transpose gather at resized block_len 4 (decode bucket 512 with 32-token blocks)
 #            instead of the PE-transpose fallback (-54 to -57 % at bucket 512); this is what makes a 512 decode
 #            context bucket faster than 1024.
+#   fp8st  : 'stitch' for the packed FP8 KV path (fp8_packed): one k_active copy into the packed parity lane and
+#            one v_active DMA per DMA-batch group. HW: bit-identical to stock packed FP8 and -24 to -39 % vs it
+#            (b32-64, buckets 512/1024). fp8_packed already keeps the K dma_transpose gather at block_len 4.
 # Experimental flags (A/B reproduction only; need NKILIB_CR17_ALLOW_EXPERIMENTAL=1):
 #   evict  : WRONG results on trn2 (PSUM bank sharing across batches; bit-identical in the simulator).
 #   kcap64 / kcap128 : coarser K gather, 31-38 % slower.   ktpe : K via dma_copy + PE transpose, 5-10 % slower.
 #   vbuf / vskip     : persistent V buffers (+ oob skip on V); within -2..-7 % / neutral, not enabled by default.
-#   fp8st  : 'stitch' for the packed FP8 KV path (fp8_packed): one k_active copy into the packed parity lane and
-#            one v_active DMA per DMA-batch group. Simulator bit-exact vs the per-sequence stitch; not HW-verified.
-#            (fp8_packed already keeps the K dma_transpose gather at block_len 4, so it needs no 'dt4'.)
-#   fp8kc16: packed FP8 K gather cap 16 bf16 rows instead of 32, i.e. the bf16 path's batches per gather (packed
-#            rows are block_len // 2, so the stock cap doubles the batches per gather; on bf16 that coarsening,
-#            'kcap64', was 31-38 % slower on trn2). Not HW-verified.
+#   fp8kc16: packed FP8 K gather cap 16 bf16 rows (the bf16 batches per gather). HW: correct, but +7 to +32 % vs
+#            fp8st alone (fp8st+fp8kc16 vs fp8st), so not enabled.
 # Refused always: kskip / kvskip (oob skip on the K dma_transpose gather HANGS the trn2 device).
 # All flags apply only where _cr17_gate() holds (block KV, 2-byte KV, gen3, d_head 128, s_active 1,
 # unswapped QK, no row tiling, auto allocation, single NC on s_prior, bs_per_nc >= 32).
-_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "dt4+stitch").strip().lower()
+_CR17_VARIANT = os.environ.get("NKILIB_CR17_VARIANT", "dt4+stitch+fp8st").strip().lower()
 _CR17_FLAGS = tuple(_f for _f in _CR17_VARIANT.split("+") if _f and _f != "stock")
-_CR17_SUPPORTED = ("stitch", "dt4")
+_CR17_SUPPORTED = ("stitch", "dt4", "fp8st")
 for _f in _CR17_FLAGS:
     if _f not in (
         "kcap64",
