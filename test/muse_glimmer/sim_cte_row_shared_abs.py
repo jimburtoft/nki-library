@@ -2,8 +2,8 @@
 
 Runs nkilib mlp (CTE, ROW FP8) from whatever nkilib is first on PYTHONPATH and saves the output.
 Compare a stock run against a patched run (``--compare a.pt b.pt``).
-  NKI_SIMULATOR=1 NEURON_PLATFORM_TARGET_OVERRIDE=trn2 VLLM_NEURON_CPU_MODE=1 python sim_cte_row_shared_abs.py --T 512 --out stock.pt
-  PYTHONPATH=<branch>/src/nkilib_src NKI_SIMULATOR=1 ... python sim_cte_row_shared_abs.py --T 512 --out patched.pt
+  NKI_SIMULATOR=1 NEURON_PLATFORM_TARGET_OVERRIDE=trn2 VLLM_NEURON_CPU_MODE=1 python sim_cte_row_shared_abs.py --T 1024 --out stock.pt
+  (swap in this branch's mlp_cte_basic_quantization.py)  ... --T 1024 --out patched.pt
 """
 import argparse
 import os

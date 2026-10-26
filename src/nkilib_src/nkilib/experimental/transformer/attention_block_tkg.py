@@ -162,6 +162,9 @@ def attention_block_tkg(
     seq_packed_seq_id_table: Optional[nl.NkiTensor] = None,
     seq_packed_accumulator_partial_route_table: Optional[nl.NkiTensor] = None,
     seq_packed_accumulator_group_state_route_table: Optional[nl.NkiTensor] = None,
+    W_gate: Optional[nl.NkiTensor] = None,
+    W_gate_scale: Optional[nl.NkiTensor] = None,
+    gate_dq: float = 1.0,
 ):
     """
     Fused Attention Block for Token Generation (TKG).
@@ -408,6 +411,17 @@ def attention_block_tkg(
 
         CP composes with KVDP: head reduction is q_heads*KVDP*CP -> q_heads*KVDP (CP reduce)
         -> q_heads (KVDP reduce). Combined KVDP+CP works with either KVDP collective mode.
+        W_gate (Optional[nl.NkiTensor]): [H, q_heads*d_head] @ HBM, optional sigmoid output-gate
+            projection. When set, the attention output is multiplied elementwise by
+            ``sigmoid(X_norm @ W_gate)`` before the output projection, where ``X_norm`` is the same
+            (optionally rmsnorm_X-normalized) input the QKV projection reads. The gate projection is
+            issued before attention so its weight DMA overlaps the KV-cache traffic. Requires the
+            in-kernel output projection (W_out), B*S_tkg <= 128, d_head <= 128, and no KVDP / CP.
+        W_gate_scale (Optional[nl.NkiTensor]): [P_MAX, q_heads*d_head] @ HBM, per-output-channel
+            dequant scales when W_gate is FP8 (QuantizationType.ROW). None for BF16 W_gate.
+        gate_dq (float): Constant folded into the gate after the sigmoid, e.g. the FP8 KV V dequant
+            scale, which cannot be absorbed into W_out because the gate sits between attention and
+            the output projection. Default 1.0.
 
     Returns:
         out (nl.NkiTensor): Output tensor with shape depending on projection and output location:
@@ -710,6 +724,53 @@ def attention_block_tkg(
             CP_replica_group,
             sbm,
         )
+
+    # ========== output gate, sigmoid(X_norm @ W_gate) in the attention-output layout ==========
+    # Issued before attention so the gate weight DMA overlaps the KV traffic. Same input as the QKV
+    # projection (fused rmsnorm_X when enabled). Result: gate_sb [d_head, B*q_heads*S_tkg] @ SBUF in the
+    # (b, n, s) column order of attention_tkg's out_in_sb output, so the multiply is elementwise.
+    gate_sb = None
+    if W_gate != None:
+        kernel_assert(do_out_proj, "W_gate requires the in-kernel output projection (W_out)")
+        kernel_assert(n_bxs_tiles == 1, "W_gate requires B*S_tkg <= 128")
+        kernel_assert(d_head <= nl.tile_size.pmax, "W_gate requires d_head <= 128")
+        kernel_assert(not is_KVDP and not is_CP, "W_gate does not support KVDP / CP")
+        # Distinct tensor names: the second qkv() call in one kernel would otherwise reuse the first call's
+        # SBUF op names ("duplicate op name 'qkv_w_sb_block_0'" at trace time; the simulator does not check).
+        _gate_prefix_prev = sbm.get_name_prefix()
+        sbm.set_name_prefix(f"{_gate_prefix_prev}gate_")
+        G_out = qkv(
+            input=X,
+            fused_qkv_weights=W_gate,
+            output_layout=QKVOutputLayout.BSD,
+            bias=None,
+            fused_norm_type=NormType.RMS_NORM if rmsnorm_X_enabled else NormType.NO_NORM,
+            gamma_norm_weights=rmsnorm_X_gamma,
+            norm_eps=rmsnorm_X_eps,
+            hidden_actual=X_hidden_dim_actual,
+            quantization_type=QuantizationType.ROW if W_gate_scale != None else QuantizationType.NONE,
+            qkv_w_scale=W_gate_scale,
+            qkv_in_scale=None,
+            d_head=None,
+            num_q_heads=None,
+            num_kv_heads=None,
+            store_output_in_sbuf=True,
+            sbm=sbm,
+            use_auto_allocation=True,
+            transposed_in=transposed_in,
+            is_h_dim_4h_transposed=False,
+            dtype_mode=dtype_mode,
+        )
+        sbm.set_name_prefix(_gate_prefix_prev)
+        G_out = G_out.reshape((B * S_tkg, q_heads * d_head))  # [B*S, N*d] @ SBUF (both cores hold the sum)
+        gate_sb = sbm.alloc_stack((d_head, B * q_heads * S_tkg), dtype=X.dtype, buffer=nl.sbuf)
+        gate_4d = gate_sb.reshape((d_head, B, q_heads, S_tkg))
+        for head_idx in range(q_heads):
+            g_ps = nl.ndarray((d_head, B * S_tkg), dtype=X.dtype, buffer=nl.psum)
+            nisa.nc_transpose(g_ps, G_out[:, nl.ds(head_idx * d_head, d_head)])
+            nisa.activation(dst=gate_4d[:, :, head_idx, :], op=nl.sigmoid, data=g_ps.reshape((d_head, B, S_tkg)))
+        if gate_dq != 1.0:
+            nisa.tensor_scalar(dst=gate_sb, data=gate_sb, op0=nl.multiply, operand0=gate_dq)
 
     # ========== Attention Computation ==========
     # Input:  Q_tkg_sb [d_head, B_attn*q_heads_attn*S_tkg] @ SBUF
@@ -1036,6 +1097,10 @@ def attention_block_tkg(
     # Input:  attn_out [d_head, B, q_heads, S_tkg] @ SBUF/HBM
     # Output: kernel_output layout depends on transposed_out and out_in_sb
     if do_out_proj:
+        if gate_sb != None:
+            # attn_out is [d_head, B*q_heads*S] @ SBUF (out_in_sb path, kv heads folded into batch
+            # in head order == (b, n, s) column order); apply the gate in place.
+            nisa.tensor_tensor(attn_out, attn_out, gate_sb, op=nl.multiply)
         attn_for_proj = attn_out.reshape((d_head, B, q_heads, S_tkg))
         # MX output projection requires attention input on HBM for reshaping over the partition dimension.
         # We cannot output attention directly to HBM earlier because KVDP requires the input in SBUF.
