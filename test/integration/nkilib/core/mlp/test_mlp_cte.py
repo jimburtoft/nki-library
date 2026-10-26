@@ -180,6 +180,9 @@ MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_FALSE = [
     [2, 1, 578, 1408, 352, 105223169, 2e-2, NormType.LAYER_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, True, True, True, ActFnType.GELU, False, True, True, True],
     [2, 1, 36864, 8192, 512, 8367215426, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.GELU, False, False, False, False],
     [2, 1, 512, 8192, 3584, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    # I >= 4096 with projection biases (ViT-style fc1/fc2 MLP): the I >= 4096 rule forced I-sharding,
+    # which does not apply biases, so the up/down bias was silently dropped.
+    [2, 1, 512, 1024, 4096, None, 2e-2, NormType.NO_NORM, QuantizationType.NONE, MLPGateUpWeightLayout.CONTIGUOUS, False, False, True, ActFnType.GELU, False, True, True, False],
 ]
 
 MLP_CTE_UNIT_TEST_CASES_GATE_BIAS_TRUE = [

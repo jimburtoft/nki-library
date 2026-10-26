@@ -71,7 +71,9 @@ def calculate_sharding(mlp_params: MLPParameters):
     if mlp_params.hidden_size < 7168 or mlp_params.intermediate_size < 1024:
         shard_on_inter = False
 
-    if mlp_params.intermediate_size >= 4096:
+    # Large I prefers I-sharding, but I-sharding does not apply projection biases (see above), so keep
+    # the bias guard: forcing it with a gate/up/down bias silently dropped the bias.
+    if mlp_params.intermediate_size >= 4096 and not mlpp_has_projection_bias(mlp_params):
         shard_on_inter = True
 
     if shard_on_inter:
