@@ -250,6 +250,11 @@ MLP_CTE_UNIT_TEST_CASES_ROW_QUANT = [
     # Intermediate size whose 256-row remainder exceeds 128, i.e. the double-row down projection
     # has a trailing pair of intermediate blocks that cannot be fed as one double-row matmul.
     pytest.param(1, 1, 256, 1024, 448, None, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False, marks=pytest.mark.fast),
+    # 1024-row BxS tile at a large per-core intermediate: the row-quant |x| scratch was allocated once per
+    # 128-row subtile (8 x [128, 2560] fp32) and the kernel failed validation with "Stack out of memory".
+    # H=6656 / I=5120 at LNC=2 (2560 per core) is a dense 30B decoder at TP=4 with I padded to 128.
+    [2, 1, 1024, 6656, 5120, None, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
+    [2, 1, 2048, 6656, 5120, None, 4e-2, NormType.NO_NORM, QuantizationType.ROW, MLPGateUpWeightLayout.CONTIGUOUS, False, False, False, ActFnType.SiLU, False, False, False, False],
 ]
 
 MLP_CTE_UNIT_TEST_CASES_STATIC_QUANT = [

@@ -24,8 +24,7 @@ from ....utils.kernel_helpers import get_max_positive_value_for_dtype
 from ....utils.tiled_range import TiledRange
 from ...mlp_parameters import MLPParameters
 from ..mlp_cte_constants import MlpBxsIndices, MLPCTEConstants
-from .mlp_cte_basic_allocation import allocate_intermediate_tensor_tile
-from .mlp_cte_basic_tile_info import MLPCTEBasicTileInfo
+from .mlp_cte_basic_tile_info import MLPCTEBasicTileInfo, get_intermediate_tile_tensor_info
 
 _MINVAL = 1e-6
 
@@ -137,17 +136,20 @@ def _perform_intermediate_row_quantization(
     if sbm != None:
         sbm.open_scope("row_quantization")
 
+    # The elementwise |x| written by tensor_scalar_reduce below is a discarded destination:
+    # only its reduce_res (the per-row absmax) is used. Allocating one [P, I] scratch per
+    # BxS subtile overflows the stack for 1024-row BxS tiles at large I (e.g. 8 x [128, 2560]
+    # fp32 = 80 KiB/partition at I=2560), so all subtiles share one buffer. The reductions run
+    # in order on the same engine, so sharing the destination does not change results.
     quant_abs_sbuf_list = []
-    allocate_intermediate_tensor_tile(
-        mlp_params,
-        tile_info,
-        constants,
-        indices,
-        'row_quant_reduction_res',
-        constants.compute_data_type,
-        quant_abs_sbuf_list,
-        sbm.alloc_stack,
+    shared_abs_shape, _ = get_intermediate_tile_tensor_info(mlp_params, constants, bxs_dim_tile)
+    shared_abs_sbuf = sbm.alloc_stack(
+        shared_abs_shape,
+        dtype=constants.compute_data_type,
+        name=indices.get_tensor_name('row_quant_reduction_res', 'shared'),
     )
+    for _ in range(BXS_SUBTILE_COUNT):
+        quant_abs_sbuf_list.append(shared_abs_sbuf)
     quant_scales_sbuf_list = []
     for bxs_subtile_idx in range(BXS_SUBTILE_COUNT):
         quant_scales_sbuf = sbm.alloc_stack(
