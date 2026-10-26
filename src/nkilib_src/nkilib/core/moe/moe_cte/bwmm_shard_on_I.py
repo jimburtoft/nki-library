@@ -67,6 +67,8 @@ FP8_SCALE_COALESCE = _FP8_SCALE_COALESCE
 # Applies to BF16 and FP8. NKILIB_DOWN_BIAS_DMA_BCAST=0 restores the shuffles.
 _DOWN_BIAS_DMA_BCAST = os.environ.get("NKILIB_DOWN_BIAS_DMA_BCAST", "1") != "0"
 DOWN_BIAS_DMA_BCAST = _DOWN_BIAS_DMA_BCAST
+# Marker for callers: gate_up_proj_weight may be passed gate/up-major as [E, 2, H, I_TP].
+SUPPORTS_GATE_UP_MAJOR = True
 
 # Block quant tile size: scales are organized as 256x256 blocks along (H, I_TP).
 BLOCK_QUANT_SIZE = 256
@@ -1751,7 +1753,14 @@ def load_gate_up_proj_weights_shard_intermediate(
     else:
         N_WEIGHTS = 1
 
-    _, H, _, _I_TP = gate_up_proj_weight.shape
+    # Layout: [E, H, 2, I_TP] (stock) or gate/up-major [E, 2, H, I_TP], detected by shape[1] == 2 (H >= 512 is
+    # asserted, so the two cannot be confused). Gate/up-major lets one FP8 tensor serve this kernel and moe_tkg,
+    # which reads that layout with larger DMA packets (SUPPORTS_GATE_UP_MAJOR).
+    _gu_major = gate_up_proj_weight.shape[1] == 2
+    if _gu_major:
+        _, _, H, _I_TP = gate_up_proj_weight.shape
+    else:
+        _, H, _, _I_TP = gate_up_proj_weight.shape
     I_TP_per_shard = _I_TP // num_shards
     I_TP_offset = I_TP_per_shard * shard_id
     h_outer_tripcount = div_ceil(H, PSUM_SIZE)
@@ -1778,7 +1787,22 @@ def load_gate_up_proj_weights_shard_intermediate(
             if num_p_elems < TILE_SIZE:
                 nisa.memset(dst=load_dst[h_i][0:TILE_SIZE, h_j, 0:N_WEIGHTS, 0:I_TP_per_shard], value=0.0)
 
-            if cfg.fuse_gate_and_up_load:
+            if _gu_major:
+                # [E, 2, H, I]: element (g, h, i) of an expert is at g * H * I + h * I + i.
+                g0 = 0 if cfg.fuse_gate_and_up_load else gate_or_up
+                offset = g0 * H * _I_TP + load_p_offset * _I_TP + I_TP_offset
+                nisa.dma_copy(
+                    dst=load_dst[h_i][0:num_p_elems, h_j, 0:N_WEIGHTS, 0:I_TP_per_shard],
+                    src=gate_up_proj_weight.ap(
+                        pattern=[[_I_TP, num_p_elems], [H * _I_TP, N_WEIGHTS], [1, I_TP_per_shard]],
+                        offset=offset,
+                        scalar_offset=block_expert,
+                        indirect_dim=0,
+                    ),
+                    oob_mode=nisa.oob_mode.skip if cfg.skip_dma.skip_weight else nisa.oob_mode.error,
+                    dge_mode=nisa.dge_mode.hwdge,  # keep weight DMAs off the busy GpSimd queue
+                )
+            elif cfg.fuse_gate_and_up_load:
                 offset = load_p_offset * (N_WEIGHTS * _I_TP) + I_TP_offset
                 nisa.dma_copy(
                     dst=load_dst[h_i][0:num_p_elems, h_j, 0:N_WEIGHTS, 0:I_TP_per_shard],

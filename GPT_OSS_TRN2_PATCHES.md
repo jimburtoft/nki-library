@@ -1,6 +1,6 @@
 # GPT-OSS decode/prefill kernel patches for Trn2 (based on NKI Library 2.33)
 
-This branch is the public `2.33` NKI Library release plus small changes to six kernels (two changes in `bwmm_shard_on_I`).
+This branch is the public `2.33` NKI Library release plus small changes to six kernels (several changes in `bwmm_shard_on_I`).
 The changes make GPT-OSS (and other MoE models with a small per-rank intermediate size)
 faster on Trn2. Each change is opt-in by shape or input layout. A caller that passes the
 stock shapes and layouts gets the same results as stock 2.33.
@@ -20,6 +20,7 @@ stock layout and the stock prefill MoE kernel.
 | `core/moe/moe_tkg` selective/all-expert | Accept gate/up weights gate/up-major as `[E, 2, H, I]` (detected by `shape[1] == 2`). This gives 2.5x larger DMA packets than `[E, H, 2, I]`. Marker: `SUPPORTS_GATE_UP_MAJOR`. | Decode, BS >= 8 |
 | `core/moe/moe_cte/bwmm_shard_on_I.py` | Per-expert weight DMAs on hardware DGE instead of software DGE on GpSimd, which is the busiest prefill engine | TTFT -5 to -8% |
 | `core/moe/moe_cte/bwmm_shard_on_I.py` per-channel FP8 | FP8 weight tiles go straight into `nc_matmul` (FP8 x BF16, FP32 accumulation; scale applied at PSUM eviction) instead of being copied to BF16 first. The down-projection scale row is broadcast to all 128 partitions by one DMA (partition stride 0) instead of 4 Vector stream shuffles per tile. The per-channel scales of a block are loaded with one DMA (gate/up) and one DMA per 1024-wide H tile (down) instead of one per 128- or 512-wide tile. `NKILIB_FP8_DIRECT_MATMUL=0` / `NKILIB_DOWN_SCALE_DMA_BCAST=0` / `NKILIB_FP8_SCALE_COALESCE=0` restore the old paths. Markers: `FP8_DIRECT_MATMUL`, `DOWN_SCALE_DMA_BCAST`, `FP8_SCALE_COALESCE`. | FP8 prefill without the BF16 expert copy (`GPTOSS_HYBRID_PREFILL=0`): TTFT +32 % -> +5 % vs the BF16 copy |
+| `core/moe/moe_cte/bwmm_shard_on_I.py` gate/up layout | Accept the gate/up weight gate/up-major as `[E, 2, H, I]` (detected by `shape[1] == 2`), the same layout `moe_tkg` reads. One FP8 tensor then serves prefill and decode. Marker: `bwmm_shard_on_I.SUPPORTS_GATE_UP_MAJOR`. | FP8 without the BF16 copy: decode as fast as with the copy |
 | `core/moe/moe_cte/bwmm_shard_on_I.py` down bias | The [1, H] down-projection bias row is broadcast to all 128 partitions by one DMA (partition stride 0) instead of Vector stream shuffles, once per block. Applies to BF16 and FP8. `NKILIB_DOWN_BIAS_DMA_BCAST=0` restores the shuffles. Marker: `DOWN_BIAS_DMA_BCAST`. | Prefill MoE kernel -9 % (BF16 and FP8); with it, FP8 without the BF16 copy matches the BF16 copy |
 | `core/attention/attention_segmented_cte.py` | Remove a dynamic loop in the sliding-window sink path that only re-copied `sink` into `sink_masked`. With a dynamic-loop MoE kernel in the same graph (for example `shard_on_i_hybrid`), neuronx-cc 2.27 failed with `NCC_IGCA024` for 6+ layers. Marker: `SWA_SINK_STATIC`. | Enables hybrid prefill MoE |
 | `experimental/transformer/attention_block_tkg.py` | GQA V extraction: one strided DMA per KV head instead of one 128-byte DMA per (batch, head) | Decode, BS > 1 |
