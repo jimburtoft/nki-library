@@ -1480,6 +1480,10 @@ def attention_segmented_cte(
                      internally when seqlen_q < prior_seg_size so the traced
                      partial-prior speculative read stays in-bounds.
         prior_tokens: Total number of prior (cached) tokens, shape (1, 1). Must be multiple of block_size.
+            This is a runtime value and is not checked: the active-block offset is computed as
+            ``prior_tokens >> log2(block_size)``, so an unaligned value silently attends to the wrong
+            KV positions for the active rows. Callers that chunk prefill must keep chunk boundaries
+            block-aligned (e.g. speculative decoding that shortens a chunk by the draft length).
         block_size: Size of each block in the KV cache
         prior_seg_size: Size of each KV segment to process iteratively
         scale: Scaling factor for attention scores (default 1.0)
