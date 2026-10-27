@@ -1,5 +1,5 @@
 """Simulator check of the TKG LHS/RHS-swap down projection row-scale slice on a partial last PSUM tile
-(partial PSUM tile)? Runs NF.mlp ROW at TKG sizes on the simulator with the plugin default (column tiling)
+(a per-channel FP8 ROW scale). Runs NF.mlp ROW at TKG sizes on the simulator with the plugin default (column tiling)
 and with column_tiling=False (forces down_projection_lhs_rhs_swap), against a dequant reference.
 H=6656 -> H1=52, H1_shard=26 at LNC2; with the swap path the issue shows whenever 26 % (512 // T) != 0.
   NKI_SIMULATOR=1 NEURON_PLATFORM_TARGET_OVERRIDE=trn2 VLLM_NEURON_CPU_MODE=1 python sim_tkg_row_scale_partial_psum_tile.py
