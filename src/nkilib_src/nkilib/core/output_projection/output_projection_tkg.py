@@ -53,6 +53,21 @@ from ..utils.tiled_range import TiledRange
 from .output_projection_tkg_mx_impl import _output_projection_tkg_mx
 from .output_projection_utils import calculate_head_packing
 
+import os as _os
+
+# Bias as a PSUM-initializing ones-matmul (no [B*S, H] bias broadcast tile and no separate add at eviction).
+# NKILIB_OPROJ_BIAS_PSUM_INIT=0 restores the broadcast + tensor_tensor add.
+_BIAS_PSUM_INIT = _os.environ.get("NKILIB_OPROJ_BIAS_PSUM_INIT", "1") != "0"
+BIAS_PSUM_INIT = _BIAS_PSUM_INIT
+# W_out weight loads: by default they land on the GpSimd software-DGE queue, which in decode also issues the
+# KV-cache gather/transposes. "scalar" puts them on the Scalar engine hardware DGE instead.
+# Default "" = compiler placement (measured on trn2 GPT-OSS 20B: "scalar" is +0.4 % at BS 1, -0.3..-0.9 % at BS 2-32).
+_WOUT_DMA_ENGINE = _os.environ.get("NKILIB_OPROJ_WOUT_DMA_ENGINE", "")
+_WOUT_DMA_KW = (
+    {"engine": getattr(nisa.engine, _WOUT_DMA_ENGINE), "dge_mode": nisa.dge_mode.hwdge} if _WOUT_DMA_ENGINE else {}
+)
+WOUT_DMA_ENGINE = _WOUT_DMA_ENGINE
+
 P_MAX = 128
 F_MAX = 512
 NUM_PSUM_BANKS = 8
@@ -260,7 +275,10 @@ def output_projection_tkg(
     Because they coexist, their DMA loads target disjoint addresses,
     preventing anti-dependencies.
     """
-    if not cfg.transpose_out and cfg.has_bias:
+    if not cfg.transpose_out and cfg.has_bias and _use_bias_psum_init(cfg):
+        bias_sb = _prepare_bias_psum_init(bias=bias, cfg=cfg, sbm=sbm)
+        bias_sb_1d_allocated = False
+    elif not cfg.transpose_out and cfg.has_bias:
         BxS_block_size = min(P_MAX, bxs_size)
         bias_sb = _prepare_bias(bias=bias, cfg=cfg, sbm=sbm)
         bias_sb_1d_allocated = True
@@ -828,6 +846,26 @@ def _prepare_quant_scales(
         return None, None
 
 
+def _use_bias_psum_init(cfg: OutputProjectionTkgConfig) -> bool:
+    """Whether bias can initialize the column-tiled output PSUM directly (unquantized, B*S <= 32)."""
+    return (
+        _BIAS_PSUM_INIT
+        and cfg.has_bias
+        and cfg.quantization_type == QuantizationType.NONE
+        and not cfg.transpose_out
+        and not cfg.use_double_row
+        and cfg.b_size * cfg.s_size <= 32
+    )
+
+
+def _prepare_bias_psum_init(bias: nl.NkiTensor, cfg: OutputProjectionTkgConfig, sbm: BufferManager) -> nl.NkiTensor:
+    """Load one unbroadcast [1, h_sharded] bias row for the PSUM-initializing matmul."""
+    bias_shard = bias.reshape_dim(1, (cfg.num_prgs, cfg.h_sharded)).select(dim=1, index=cfg.prg_id)
+    bias_sb = sbm.alloc_stack((1, cfg.h_sharded), dtype=bias.dtype, buffer=nl.sbuf, align=cfg.align)
+    nisa.dma_copy(dst=bias_sb, src=bias_shard)
+    return bias_sb
+
+
 def _prepare_bias(
     bias: nl.NkiTensor,
     cfg: OutputProjectionTkgConfig,
@@ -1258,6 +1296,7 @@ def _load_weight_h_block(
     if not cfg.use_double_row:
         for head_idx in nl.affine_range(cfg.n_size):
             nisa.dma_copy(
+                **_WOUT_DMA_KW,
                 src=w_h_sliced.select(dim=0, index=head_idx),
                 dst=w_sbuf_slot[head_idx][:, :h_block_size],
             )
@@ -1265,10 +1304,12 @@ def _load_weight_h_block(
         for head_idx in nl.affine_range(0, cfg.n_size, 2):
             pair_idx = head_idx // 2
             nisa.dma_copy(
+                **_WOUT_DMA_KW,
                 src=w_h_sliced.select(dim=0, index=head_idx),
                 dst=w_sbuf_slot[pair_idx][:, 0, :h_block_size],
             )
             nisa.dma_copy(
+                **_WOUT_DMA_KW,
                 src=w_h_sliced.select(dim=0, index=head_idx + 1),
                 dst=w_sbuf_slot[pair_idx][:, 1, :h_block_size],
             )
@@ -1312,6 +1353,11 @@ def _output_projection_tkg_impl(
     kernel_assert(cfg.out_in_sb == (out_sb != None), "Expected pre-allocated out_sb when cfg.out_in_sb == True")
     sbm.open_scope("output_projection_tkg_impl")
     bxs_size = cfg.b_size * cfg.s_size
+    bias_psum_init = _use_bias_psum_init(cfg)
+    bias_broadcast_ones = None
+    if bias_psum_init:
+        bias_broadcast_ones = sbm.alloc_stack((1, bxs_size), dtype=bias_sb.dtype, buffer=nl.sbuf, align=cfg.align)
+        nisa.memset(dst=bias_broadcast_ones, value=1.0)
 
     w_scale_dtype = quant_config.weight_scale_hbm.dtype if cfg.quantization_type == QuantizationType.ROW else None
     num_bxs_tiles = div_ceil(bxs_size, P_MAX)
@@ -1418,6 +1464,21 @@ def _output_projection_tkg_impl(
                 )
 
                 global_psum_idx = 0 if global_psum_idx + 1 >= NUM_PSUM_BANKS else global_psum_idx + 1
+                if bias_psum_init:
+                    # Seed each column tile's PSUM with ones[1, B*S]^T @ bias[1, f]: the bias broadcast
+                    # happens in the PE array, so the eviction is a plain copy.
+                    for col_idx in range(n_col_tiles):
+                        f_offset = h_block_f_tile_group.start_offset + col_idx * F_MAX
+                        f_size = min(F_MAX, h_block_f_tile_group.size - col_idx * F_MAX)
+                        h_offset = cur_h_block_offset + f_offset
+                        nisa.nc_matmul(
+                            dst=res_psum[nl.ds(col_tiling_dim * col_idx, bxs_block.size), 0:f_size],
+                            stationary=bias_broadcast_ones,
+                            moving=bias_sb[:, nl.ds(h_offset, f_size)],
+                            tile_position=(0, col_tiling_dim * col_idx),
+                            tile_size=(1, col_tiling_dim),
+                            is_stationary_onezero=True,
+                        )
 
                 if not cfg.use_double_row:
                     for head_idx in nl.affine_range(cfg.n_size):
@@ -1477,7 +1538,7 @@ def _output_projection_tkg_impl(
                         )
 
                     res_slice = out_sb_slice if cfg.is_quantized else res_psum_slice
-                    if cfg.has_bias:
+                    if cfg.has_bias and not bias_psum_init:
                         nisa.tensor_tensor(
                             dst=out_sb_slice,
                             data1=res_slice,
