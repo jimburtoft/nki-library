@@ -44,6 +44,8 @@ Features:
 
 from typing import Any, Dict, Optional, Tuple, Union
 
+import os
+
 import nki
 import nki.isa as nisa
 import nki.language as nl
@@ -79,6 +81,16 @@ from .attention_block_tkg_sharding import (
     _KVDP_attention_input_collectives,
     _KVDP_attention_output_collectives,
 )
+
+# Multi-KV-head V extraction at S_tkg == 1: one DMA per batch tile instead of one per (batch, head).
+# Set NKILIB_ABT_V_EXTRACT_PER_HEAD=1 to restore the per-(batch, head) copy.
+_V_EXTRACT_PER_HEAD = os.environ.get("NKILIB_ABT_V_EXTRACT_PER_HEAD", "0") == "1"
+
+# Feature markers (callers detect these with getattr; stock nkilib has neither):
+# in-kernel output projection for d_head = n * 128 (consumed as n 128-wide virtual heads), and the
+# in-kernel block-KV cache update for d_head = n * 128 with a non-transposed bf16 cache.
+SUPPORTS_D256_OUT_PROJ = True
+SUPPORTS_D256_BLOCK_KV_UPDATE = True
 
 
 # TODO(NKI-699): Refactor API to use configuration dataclasses for better clarity
@@ -532,22 +544,34 @@ def attention_block_tkg(
         kernel_assert(CP_replica_group is not None, "CP_replica_group is required when CP > 1")
     I = d_head * (q_heads + 2 * kv_heads)
 
-    # d_head > pmax: in-kernel output projection is not supported (output_projection_tkg requires
-    # D <= 128). Callers must pass W_out=None and apply the output projection externally, consuming
-    # the returned per-head attention output [B, q_heads, d_head, S]. Attention/QKV/KV for d>128 are
-    # supported (see _process_head_group's n_d_tiles > 1 path).
+    # d_head > pmax: output_projection_tkg contracts over D <= 128. A d_head = n_d_tiles * 128 head
+    # is consumed as n_d_tiles 128-wide "virtual heads": out = sum_n attn[n] @ W[n] splits exactly
+    # into sum over (n, i_d) of attn[n, i_d*128:(i_d+1)*128] @ W[n, i_d*128:(i_d+1)*128, :], and both
+    # the [B, q_heads, d_head, S] attention output and the [q_heads*d_head, H] weight reshape to
+    # [B, q_heads*n_d_tiles, 128, S] and [q_heads*n_d_tiles*128, H] without moving data.
     kernel_assert(
-        not do_out_proj or d_head <= nl.tile_size.pmax,
-        f"In-kernel output projection (W_out != None) is not supported for d_head > {nl.tile_size.pmax} "
-        f"(got d_head={d_head}); pass W_out=None and project externally.",
+        not do_out_proj or d_head <= nl.tile_size.pmax or d_head % nl.tile_size.pmax == 0,
+        f"In-kernel output projection for d_head > {nl.tile_size.pmax} requires d_head % {nl.tile_size.pmax} == 0 "
+        f"(got d_head={d_head}).",
+    )
+    kernel_assert(
+        not do_out_proj or d_head <= nl.tile_size.pmax or not (transposed_out or out_in_sb),
+        f"In-kernel output projection for d_head > {nl.tile_size.pmax} currently supports only "
+        f"transposed_out=False, out_in_sb=False.",
     )
     # d_head > pmax: the in-kernel block-KV cache update transposes K over the D dim
     # (_update_block_cache_vectorized), which requires D <= 128. Callers must pass update_cache=False
     # and scatter the returned new K/V into the cache externally.
+    # d_head > pmax: the block-KV scatter transposes K from [d, B*S] to [B*S, d] per 128-wide
+    # d-tile (each d-tile is an independent [pmax, B*S] -> [B*S, pmax] transpose into its column
+    # slice), so it is supported for block KV with a non-transposed bf16 cache. Flat KV, K_cache
+    # transposed, and fp8-packed K still require D <= 128.
     kernel_assert(
-        not update_cache or d_head <= nl.tile_size.pmax,
-        f"In-kernel KV cache update (update_cache=True) is not supported for d_head > {nl.tile_size.pmax} "
-        f"(got d_head={d_head}); pass update_cache=False and update the cache externally.",
+        not update_cache
+        or d_head <= nl.tile_size.pmax
+        or (d_head % nl.tile_size.pmax == 0 and is_block_kv and not K_cache_transposed and not fp8_packed),
+        f"In-kernel KV cache update (update_cache=True) for d_head > {nl.tile_size.pmax} requires block KV, "
+        f"K_cache_transposed=False, fp8_packed=False and d_head % {nl.tile_size.pmax} == 0 (got d_head={d_head}).",
     )
     if use_seq_packed_attention:
         # Sequence-packed dispatch. See attention_tkg_sequence_packing_design_spec.md in
@@ -761,7 +785,17 @@ def attention_block_tkg(
                 name=f"{sbm.get_name_prefix()}attn_v_active_hbm",
             )
         else:  # attn_out @ SBUF
-            attn_out = sbm.alloc_stack((d_head, B_folded * q_per_group * S_tkg), dtype=X.dtype, buffer=nl.sbuf)
+            if d_head > nl.tile_size.pmax:
+                # d>128: attention_tkg's out_in_sb store writes the d-tiled layout
+                # [pmax, n_d_tiles * B_folded*q_per_group*S], d-tile outermost. With s_prior sharding
+                # both cores receive the summed result (the HBM store lands on core 0 only).
+                attn_out = sbm.alloc_stack(
+                    (nl.tile_size.pmax, (d_head // nl.tile_size.pmax) * B_folded * q_per_group * S_tkg),
+                    dtype=X.dtype,
+                    buffer=nl.sbuf,
+                )
+            else:
+                attn_out = sbm.alloc_stack((d_head, B_folded * q_per_group * S_tkg), dtype=X.dtype, buffer=nl.sbuf)
 
         # Prepare KV cache views for attention (fold kv_heads into batch)
         if is_block_kv:
@@ -850,7 +884,8 @@ def attention_block_tkg(
             k_out_in_sb=False,
             # For d>128, attention_tkg's native d-tiled store only targets HBM (out_in_sb=False),
             # writing the de-tiled [B_folded, q_per_group, d_head, S] layout directly.
-            out_in_sb=(do_out_proj or out_in_sb or is_KVDP or is_CP) and (d_head <= nl.tile_size.pmax),
+            out_in_sb=((do_out_proj or out_in_sb or is_KVDP or is_CP) and (d_head <= nl.tile_size.pmax))
+            or (do_out_proj and d_head > nl.tile_size.pmax and not is_KVDP and not is_CP),
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
             fp8_packed=fp8_packed,
             return_cp_softmax_stats=is_CP,
@@ -991,13 +1026,13 @@ def attention_block_tkg(
         # V_tkg from SBUF (small batch) or HBM. The reshape is an identity when kv_heads == 1.
         V_tkg_folded = V_tkg_sb if V_tkg_sb is not None else V_tkg_hbm.reshape((B_folded, 1, S_tkg, d_head))
 
-        # In-kernel KV cache update requires d_head <= pmax (asserted above), so this path is
-        # only reached for d<=128, where K_tkg_sb is the untiled [d_head, B*kv*S] layout
-        # _kv_cache_update expects.
+        # d<=128: K_tkg_sb is the untiled [d_head, B*kv*S] layout. d>128: it is d-tiled
+        # [pmax, n_d * B*kv*S] (d-tile outermost); the block scatter handles that per d-tile.
         _kv_cache_update(
             K_cache=K_cache_folded,
             V_cache=V_cache_folded,
             K_tkg=K_tkg_sb,
+            n_d_tiles=max(1, d_head // nl.tile_size.pmax),
             V_tkg=V_tkg_folded,
             kv_cache_update_idx=kv_idx_folded,
             B=B_folded,
@@ -1035,7 +1070,43 @@ def attention_block_tkg(
     # ========== Output Projection (Optional) ==========
     # Input:  attn_out [d_head, B, q_heads, S_tkg] @ SBUF/HBM
     # Output: kernel_output layout depends on transposed_out and out_in_sb
-    if do_out_proj:
+    if do_out_proj and d_head > nl.tile_size.pmax:
+        # attn_out: [B_folded, q_per_group, d_head, S] @ HBM == [B, q_heads, d_head, S] (kv heads fold
+        # into batch in head order). View as n_d_tiles 128-wide virtual heads, then present the
+        # [D', B, N', S] layout output_projection_tkg loads (its DMA handles the strided view).
+        # attn_out @ SBUF: [pmax, n_d * B * q_heads * S], d-tile outermost: column
+        # ((i_d*B + b)*q_heads + n)*S + s holds attn[b, n, i_d*pmax : (i_d+1)*pmax, s].
+        # output_projection_tkg wants a contiguous [D'=pmax, B, N', S] with N' = q_heads*n_d virtual
+        # heads, v = n*n_d + i_d, matching W_out rows (n, i_d, p) == W_out.reshape(N'*pmax, H) as-is.
+        # Re-pack with one SBUF->SBUF copy per (i_d, n) (n_d*q_heads small copies of B*S columns).
+        _P = nl.tile_size.pmax
+        _n_d = d_head // _P
+        _BS = B * S_tkg
+        attn_virt_sb = sbm.alloc_stack((_P, B * q_heads * _n_d * S_tkg), dtype=attn_out.dtype, buffer=nl.sbuf)
+        src_v = attn_out.reshape((_P, _n_d, B, q_heads, S_tkg))
+        dst_v = attn_virt_sb.reshape((_P, B, q_heads, _n_d, S_tkg))
+        for i_d in range(_n_d):
+            for n in range(q_heads):
+                nisa.tensor_copy(
+                    dst=dst_v[:, :, n, i_d, :],
+                    src=src_v[:, i_d, :, n, :],
+                    engine=nisa.vector_engine if (i_d * q_heads + n) % 2 == 0 else nisa.scalar_engine,
+                )
+        attn_for_proj = attn_virt_sb.reshape((_P, B, q_heads * _n_d, S_tkg))
+        w_out_virt = W_out.reshape((q_heads * _n_d * _P, W_out.shape[-1]))
+        kernel_output = output_projection_tkg(
+            attention=attn_for_proj,
+            weight=w_out_virt,
+            bias=bias_out,
+            quantization_type=quantization_type_out,
+            weight_scale=weight_dequant_scale_out,
+            input_scale=input_dequant_scale_out,
+            TRANSPOSE_OUT=transposed_out,
+            OUT_IN_SB=out_in_sb,
+            sbm=sbm,
+            dtype_mode=dtype_mode,
+        )
+    elif do_out_proj:
         attn_for_proj = attn_out.reshape((d_head, B, q_heads, S_tkg))
         # MX output projection requires attention input on HBM for reshaping over the partition dimension.
         # We cannot output attention directly to HBM earlier because KVDP requires the input in SBUF.
@@ -1824,10 +1895,9 @@ def _QKV_processing(
     n_d_tiles = d_head // nl.tile_size.pmax
     is_d_tiled = n_d_tiles > 1
     if is_d_tiled:
-        kernel_assert(
-            n_bxs_tiles == 1,
-            f"d_head>128 tiled Q/K path requires B*S_tkg <= pmax (single tile), got n_bxs_tiles={n_bxs_tiles}",
-        )
+        # B*S_tkg > pmax: each BxS tile is produced into a tile-local d-tiled buffer by the
+        # single-tile path, then its n_d_tiles column segments are copied into the full-batch
+        # buffer (column i_d*(B*H*S) + b*(H*S) + h*S + s).
         Q_sb = sbm.alloc_stack((nl.tile_size.pmax, n_d_tiles * B * q_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
         K_sb = sbm.alloc_stack((nl.tile_size.pmax, n_d_tiles * B * kv_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
     else:
@@ -1878,6 +1948,11 @@ def _QKV_processing(
         # Process Q. d>128 uses the tiled producer (writes full-batch tiled Q_sb); else the
         # mainline per-tile head group.
         if is_d_tiled:
+            if n_bxs_tiles > 1:
+                q_dst = sbm.alloc_stack((nl.tile_size.pmax, n_d_tiles * tile_B * q_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
+                k_dst = sbm.alloc_stack((nl.tile_size.pmax, n_d_tiles * tile_B * kv_heads * S_tkg), dtype=io_dtype, buffer=nl.sbuf)
+            else:
+                q_dst, k_dst = Q_sb, K_sb
             _process_head_group(
                 dst_4d=None,
                 QKV=qkv_sb,
@@ -1894,10 +1969,10 @@ def _QKV_processing(
                 rmsnorm_post_W=rmsnorm_post_W_Q,
                 sbm=sbm,
                 n_d_tiles=n_d_tiles,
-                d_tiled_out=Q_sb,
+                d_tiled_out=q_dst,
                 n_heads=q_heads,
                 d=d_head,
-                B=B,
+                B=tile_B,
                 S=S_tkg,
             )
             _process_head_group(
@@ -1916,12 +1991,24 @@ def _QKV_processing(
                 rmsnorm_post_W=rmsnorm_post_W_K,
                 sbm=sbm,
                 n_d_tiles=n_d_tiles,
-                d_tiled_out=K_sb,
+                d_tiled_out=k_dst,
                 n_heads=kv_heads,
                 d=d_head,
-                B=B,
+                B=tile_B,
                 S=S_tkg,
             )
+            if n_bxs_tiles > 1:
+                # Scatter the tile-local d-tiled Q/K into the full-batch buffers.
+                for i_d in range(n_d_tiles):
+                    nisa.tensor_copy(
+                        dst=Q_sb[:, nl.ds(i_d * (B * q_heads * S_tkg) + tile_b_start * (q_heads * S_tkg), tile_B * q_heads * S_tkg)],
+                        src=q_dst[:, nl.ds(i_d * (tile_B * q_heads * S_tkg), tile_B * q_heads * S_tkg)],
+                    )
+                for i_d in range(n_d_tiles):
+                    nisa.tensor_copy(
+                        dst=K_sb[:, nl.ds(i_d * (B * kv_heads * S_tkg) + tile_b_start * (kv_heads * S_tkg), tile_B * kv_heads * S_tkg)],
+                        src=k_dst[:, nl.ds(i_d * (tile_B * kv_heads * S_tkg), tile_B * kv_heads * S_tkg)],
+                    )
         else:
             # Process Q tile directly into Q_sb's [:, tile_b_start:tile_b_start+tile_B, :, :] slice
             _process_head_group(
@@ -1974,15 +2061,24 @@ def _QKV_processing(
             nisa.tensor_copy(v_all_sb, qkv_sb[:, nl.ds(d_head * (q_heads + kv_heads), kv_heads * d_head)])
             if kv_quant:
                 v_all_sb = _quantize_to_fp8(v_all_sb, v_scale, sbm, kv_quant_dtype)
-            V_hbm_flat = V_hbm.reshape((B * kv_heads * S_tkg, d_head))
-            for batch_idx in range(tile_B):
-                src_start = batch_idx * S_tkg
-                flat_dst = (tile_b_start + batch_idx) * kv_heads * S_tkg
-                for kv_head_idx in range(kv_heads):
-                    nisa.dma_copy(
-                        V_hbm_flat[nl.ds(flat_dst + kv_head_idx * S_tkg, S_tkg), :],
-                        v_all_sb[nl.ds(src_start, S_tkg), nl.ds(kv_head_idx * d_head, d_head)],
-                    )
+            if S_tkg == 1 and not _V_EXTRACT_PER_HEAD:
+                # At S_tkg == 1, V_hbm [B, kv_heads, 1, d_head] is row-major [B, kv_heads * d_head], the
+                # same layout as v_all_sb. Copy the batch tile with one DMA. The per-(batch, head) loop
+                # below issues tile_B * kv_heads small DMAs, and the fixed cost of each DMA dominates.
+                nisa.dma_copy(
+                    V_hbm.reshape((B, kv_heads * d_head))[nl.ds(tile_b_start, tile_B), :],
+                    v_all_sb[nl.ds(0, tile_B), :],
+                )
+            else:
+                V_hbm_flat = V_hbm.reshape((B * kv_heads * S_tkg, d_head))
+                for batch_idx in range(tile_B):
+                    src_start = batch_idx * S_tkg
+                    flat_dst = (tile_b_start + batch_idx) * kv_heads * S_tkg
+                    for kv_head_idx in range(kv_heads):
+                        nisa.dma_copy(
+                            V_hbm_flat[nl.ds(flat_dst + kv_head_idx * S_tkg, S_tkg), :],
+                            v_all_sb[nl.ds(src_start, S_tkg), nl.ds(kv_head_idx * d_head, d_head)],
+                        )
 
     # Quantize K to FP8 for attention when kv_quant=True
     if kv_quant:
@@ -2088,6 +2184,7 @@ def _kv_cache_update(
     is_block_kv: bool,
     fp8_packed: bool = False,
     oob_skip: bool = False,
+    n_d_tiles: int = 1,
 ) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
     """
     Update KV cache with new tokens for token generation.
@@ -2133,7 +2230,9 @@ def _kv_cache_update(
         )
 
     if is_block_kv:
-        _update_block_cache(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B, fp8_packed=fp8_packed)
+        _update_block_cache(
+            K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B, fp8_packed=fp8_packed, n_d_tiles=n_d_tiles
+        )
     elif S_tkg == 1 and B > 1 and (not K_cache_transposed or B > 16):
         # vector DMA with indirect addressing, tiled over batch dim. Bug for S_tkg > 1.
         _update_flat_cache_batched(
@@ -2440,6 +2539,7 @@ def _update_block_cache(
     S_tkg: int,
     B: int,
     fp8_packed: bool = False,
+    n_d_tiles: int = 1,
 ) -> None:
     """
     Update block KV cache with new tokens.
@@ -2456,7 +2556,9 @@ def _update_block_cache(
         B: batch size
         fp8_packed: when True, K_cache packs two fp8 rows into one bf16 row using parity-split scatter DMA.
     """
-    _update_block_cache_vectorized(K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B, fp8_packed=fp8_packed)
+    _update_block_cache_vectorized(
+        K_cache, V_cache, K_tkg, V_tkg, kv_cache_update_idx, S_tkg, B, fp8_packed=fp8_packed, n_d_tiles=n_d_tiles
+    )
 
 
 def _update_block_cache_vectorized(
@@ -2468,6 +2570,7 @@ def _update_block_cache_vectorized(
     S_tkg: int,
     B: int,
     fp8_packed: bool = False,
+    n_d_tiles: int = 1,
 ) -> None:
     """Update block KV cache with new tokens using vectorized scatter DMA.
 
@@ -2502,10 +2605,17 @@ def _update_block_cache_vectorized(
             K_cache.shape == V_cache.shape,
             f"K/V cache shape mismatch: K={K_cache.shape} vs V={V_cache.shape}",
         )
-    kernel_assert(
-        K_tkg.shape == (d_head, BxS),
-        f"K_tkg shape mismatch: expected {(d_head, BxS)}, got {K_tkg.shape}",
-    )
+    if n_d_tiles > 1:
+        kernel_assert(
+            K_tkg.shape == (nl.tile_size.pmax, n_d_tiles * BxS) and d_head == n_d_tiles * nl.tile_size.pmax,
+            f"d-tiled K_tkg shape mismatch: expected {(nl.tile_size.pmax, n_d_tiles * BxS)}, got {K_tkg.shape}",
+        )
+        kernel_assert(not fp8_packed, "fp8_packed K cache update is not supported for d_head > pmax")
+    else:
+        kernel_assert(
+            K_tkg.shape == (d_head, BxS),
+            f"K_tkg shape mismatch: expected {(d_head, BxS)}, got {K_tkg.shape}",
+        )
 
     tile_sz = nl.tile_size.pmax
 
@@ -2566,7 +2676,16 @@ def _update_block_cache_vectorized(
         # K update
         if do_k_update:
             K_tile_sb = nl.ndarray((tile_B, d_head), dtype=K_tkg.dtype, buffer=nl.sbuf)
-            _transpose_sbuf(K_tkg[:, nl.ds(b_start, tile_B)], K_tile_sb)
+            if n_d_tiles > 1:
+                # d-tiled K_tkg [pmax, n_d * BxS]: d-tile i_d holds channels [i_d*pmax, (i_d+1)*pmax)
+                # for every token at columns i_d*BxS + token. Transpose each d-tile into its column slice.
+                for i_d in range(n_d_tiles):
+                    _transpose_sbuf(
+                        K_tkg[:, nl.ds(i_d * BxS + b_start, tile_B)],
+                        K_tile_sb[:, nl.ds(i_d * nl.tile_size.pmax, nl.tile_size.pmax)],
+                    )
+            else:
+                _transpose_sbuf(K_tkg[:, nl.ds(b_start, tile_B)], K_tile_sb)
 
             if fp8_packed:
                 _k_update_fp8_packed(K_cache_bf16, K_tile_sb, idx_tile, tile_B, d_head)

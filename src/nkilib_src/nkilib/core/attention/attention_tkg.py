@@ -18,6 +18,7 @@ scenarios where the active sequence length is small (typically 8 or smaller).
 """
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
@@ -62,6 +63,13 @@ _MAX_FLOAT32 = float(np.finfo(np.float32).max)
 # wasted memory bandwidth. The attention mask ensures they don't contribute
 # to the output.
 INACTIVE_BLOCK_IDX = np.int32(-1)
+
+# d_head > 128 block-KV decode (PE-transpose K path): stitch the active token K/V once per group of
+# batches instead of once per batch. The value is the SBUF budget in bytes per partition of one
+# group buffer (K and V each). It sets the group size. 0 restores the per-batch stitch.
+_D_TILED_STITCH_BYTES = int(os.environ.get("NKILIB_ATTN_TKG_D_TILED_STITCH_BYTES", "32768"))
+# Feature marker for the grouped d_head > 128 active-token stitch above.
+D_TILED_STITCH = True
 
 
 @nki.jit
@@ -2301,6 +2309,12 @@ def _compute_qk_matmul(
         )
 
     k_sb_shared = None
+    # d_head > 128 PE-transpose path: one K buffer per group of k_grp_n batches, so one strided copy per
+    # d-tile stitches the active token of every batch in the group.
+    k_grp_n = _d_tiled_stitch_group_size(
+        atp, cfg, TC, sbm, is_last_fa_tile, atp.n_d_tiles * fa_tile_s_prior * sizeinbytes(_k_sb_dtype)
+    )
+    k_last_tile_idx = num_folds_this_tile * atp.block_len - 1
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="qk_matmul")
     for i_b in range(atp.bs):
         # Load entire K_prior for current batch into sbuf (tile portion for FA)
@@ -2309,7 +2323,22 @@ def _compute_qk_matmul(
         # Requires sufficient s_prior for the packed DMA layout (small SWA windows excluded).
         # For fp8_packed: allocate as bf16 with half the seq length (each bf16 slot holds 2 fp8 values)
         # For batch-batching: allocate a fresh shared buffer per group to avoid anti-deps.
-        if atp.use_dma_transpose and k_dma_batch_n_batches > 1:
+        if k_grp_n > 1:
+            k_grp_b = i_b % k_grp_n
+            if k_grp_b == 0:
+                k_grp_size = min(k_grp_n, atp.bs - i_b)
+                k_sb_shared = sbm.alloc_stack(
+                    (atp.d_tile_size, k_grp_size * atp.n_d_tiles * fa_tile_s_prior),
+                    dtype=_k_sb_dtype,
+                    buffer=nl.sbuf,
+                    align=32,
+                )
+                # The PE path below does not write the active-token column, so this copy has no
+                # dependency on the K_prior loads of the group.
+                _stitch_k_active_d_tiled_group(k_sb_shared, bufs, atp, cfg, btc, i_b, k_grp_size, fa_tile_s_prior)
+            _k_per_b = atp.n_d_tiles * fa_tile_s_prior
+            k_sb = (k_sb_shared).slice(1, start=k_grp_b * _k_per_b, end=(k_grp_b + 1) * _k_per_b)
+        elif atp.use_dma_transpose and k_dma_batch_n_batches > 1:
             if (i_b % k_dma_batch_n_batches) == 0:
                 _k_sb_free_per_batch = num_folds_this_tile * k_block_len_row_tiled * TC.p_max
                 k_sb_shared = sbm.alloc_stack(
@@ -2475,7 +2504,17 @@ def _compute_qk_matmul(
                                 else:
                                     engine = nisa.scalar_engine
 
-                                nisa.tensor_copy(k_sb[:, k_sb_offset : k_sb_offset + TC.p_max], tp_psum, engine=engine)
+                                if k_grp_n > 1 and cur_idx == k_last_tile_idx:
+                                    # Leave the active-token column (block slot p_max - 1) to the group stitch.
+                                    nisa.tensor_copy(
+                                        k_sb[:, k_sb_offset : k_sb_offset + TC.p_max - 1],
+                                        tp_psum[:, 0 : TC.p_max - 1],
+                                        engine=engine,
+                                    )
+                                else:
+                                    nisa.tensor_copy(
+                                        k_sb[:, k_sb_offset : k_sb_offset + TC.p_max], tp_psum, engine=engine
+                                    )
             sbm.close_scope()
         elif not cfg.tp_k_prior:
             kernel_assert(
@@ -2586,7 +2625,9 @@ def _compute_qk_matmul(
                 nisa.dma_transpose(k_sb_view, k_prior_view)
 
         # If on final NC and last FA tile, add K_active to the end of k_sb
-        if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
+        if k_grp_n > 1:
+            pass  # K_active was stitched for the whole group when its buffer was allocated
+        elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
             _stitch_k_active(
                 k_sb,
                 bufs,
@@ -4312,6 +4353,21 @@ def _compute_pv_matmul_and_store(
     # dtype_mode resolution for opaque "float8e4"). Otherwise pass through v_prior.dtype.
     _v_sb_dtype = atp.kv_e4m3_tile_dtype if atp.is_fp8_kv else v_prior.dtype
     v_sb_shared = None
+    # d_head > 128 PE-transpose path: when the V load is batched (v_dma_batch_n_batches > 1), stitch V_active
+    # for the whole V-DMA group with one DMA instead of one DMA per batch.
+    v_grp_stitch = (
+        v_dma_batch_n_batches > 1
+        and v_dma_batch_n_folds == atp.num_folds_per_batch
+        and atp.bs % v_dma_batch_n_batches == 0
+        and _d_tiled_stitch_group_size(atp, cfg, TC, sbm, is_last_fa_tile, 0) > 1
+    )
+    # When the V load is not batched (v_dma_batch_size == 1, e.g. a prime per-core batch), load V for a group of
+    # v_grp_n batches into one buffer with the same per-(batch, fold) DMAs, then stitch V_active for the group.
+    v_grp_n = 1
+    if v_dma_batch_size == 1:
+        v_grp_n = _d_tiled_stitch_group_size(
+            atp, cfg, TC, sbm, is_last_fa_tile, cfg.d_head * fa_tile_n_sprior * sizeinbytes(_v_sb_dtype)
+        )
 
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="pv_matmul")
     for i_b in range(atp.bs):
@@ -4319,7 +4375,39 @@ def _compute_pv_matmul_and_store(
         # Do strided load (horizontal tile) if not strided_mm1, otherwise load sequentially for better DMA throughput
         # V buffer allocation: shared for batch-batching, per-batch otherwise.
         per_batch_v_size = cfg.d_head * fa_tile_n_sprior
-        if v_dma_batch_n_batches > 1:
+        if v_grp_n > 1:
+            v_grp_b = i_b % v_grp_n
+            if v_grp_b == 0:
+                v_grp_size = min(v_grp_n, atp.bs - i_b)
+                v_sb_shared = sbm.alloc_stack(
+                    (TC.p_max, per_batch_v_size * v_grp_size), dtype=_v_sb_dtype, buffer=nl.sbuf
+                )
+                if atp.use_v_dma_skipping:
+                    nisa.memset(v_sb_shared, value=0)
+                sbm.open_scope()
+                for g in range(v_grp_size):
+                    for i_fold_rel in range(atp.num_folds_per_batch):
+                        idx_start = (i_b + g) * atp.num_folds_per_batch + i_fold_rel
+                        load_start = g * per_batch_v_size + i_fold_rel * atp.block_len * cfg.d_head
+                        nisa.dma_copy(
+                            dst=(v_sb_shared).slice(1, start=load_start, end=load_start + atp.block_len * cfg.d_head),
+                            src=bufs.v_prior_reshaped.ap(
+                                [
+                                    [atp.block_len * cfg.d_head, TC.p_max],
+                                    [1, atp.block_len * cfg.d_head],
+                                ],
+                                offset=0,
+                                vector_offset=v_idx_src.slice(dim=1, start=idx_start, end=idx_start + 1),
+                                indirect_dim=0,
+                            ),
+                            oob_mode=nisa.oob_mode.skip if atp.use_v_dma_skipping else nisa.oob_mode.error,
+                            name=f"v_prior_grp_load_indirect_fa{fa_ctx.fa_tile_idx}_b{i_b + g}_f{i_fold_rel}_bt{btc.batch_tile_idx}",
+                        )
+                sbm.close_scope()
+                # Issued after the group loads: it overwrites the stale active slot that they wrote.
+                _stitch_v_active_d_tiled_group(v_sb_shared, bufs, atp, cfg, TC, btc, i_b, v_grp_size, fa_tile_n_sprior)
+            v_sb = (v_sb_shared).slice(1, start=v_grp_b * per_batch_v_size, end=(v_grp_b + 1) * per_batch_v_size)
+        elif v_dma_batch_n_batches > 1:
             b_in_group = i_b % v_dma_batch_n_batches
             if b_in_group == 0:
                 v_sb_shared = sbm.alloc_stack(
@@ -4329,7 +4417,9 @@ def _compute_pv_matmul_and_store(
         else:
             v_sb = sbm.alloc_stack((TC.p_max, per_batch_v_size), dtype=_v_sb_dtype, buffer=nl.sbuf)
         v_sb_view = (v_sb).reshape_dim(1, [fa_tile_n_sprior, cfg.d_head])
-        if atp.is_block_kv:
+        if v_grp_n > 1:
+            pass  # V_prior and V_active of this batch were loaded with its group above
+        elif atp.is_block_kv:
             # For FA, compute which folds correspond to this tile
             fold_s_prior = atp.block_len * TC.p_max
             fold_start = fa_tile_offset // fold_s_prior
@@ -4417,7 +4507,15 @@ def _compute_pv_matmul_and_store(
             )
 
         # Load V_active to the last portion if needed (only on last FA tile)
-        if atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
+        if v_grp_n > 1:
+            pass  # V_active was stitched for the whole group after its V_prior loads
+        elif v_grp_stitch:
+            if i_b % v_dma_batch_n_batches == 0:
+                # Issued after the group V_prior load above: it overwrites the stale active slot.
+                _stitch_v_active_d_tiled_group(
+                    v_sb_shared, bufs, atp, cfg, TC, btc, i_b, v_dma_batch_n_batches, fa_tile_n_sprior
+                )
+        elif atp.sprior_prg_id == atp.sprior_n_prgs - 1 and is_last_fa_tile:
             if atp.is_block_kv:
                 num_blks_covering_s_active = div_ceil(cfg.s_active, atp.block_len)
                 extra_covered = num_blks_covering_s_active * atp.block_len - cfg.s_active
@@ -5781,6 +5879,71 @@ def _stitch_k_active(
                 ],
                 engine=nisa.scalar_engine,
             )
+
+
+def _d_tiled_stitch_group_size(atp, cfg, TC, sbm, is_last_fa_tile, bytes_per_batch):
+    """Return the batch group size of the d-tiled K_active/V_active group stitch, or 1 for the per-batch stitch.
+
+    The group stitch applies to block-KV decode with d_head > p_max on the PE-transpose K path: one
+    active token per batch, 2-byte KV, auto allocation, and the last FA tile of the last s_prior shard.
+    bytes_per_batch is the SBUF bytes per partition of one batch in the group buffer.
+    """
+    ok = (
+        _D_TILED_STITCH_BYTES > 0
+        and atp.is_block_kv
+        and not atp.use_dma_transpose
+        and atp.n_d_tiles > 1
+        and atp.d_tile_size == TC.p_max
+        and cfg.s_active == 1
+        and atp.qk_row_tile_factor == 1
+        and not cfg.fp8_packed
+        and not atp.is_fp8_kv
+        and not atp.qk_swapped
+        and sbm.is_auto_alloc()
+        and is_last_fa_tile
+        and atp.sprior_prg_id == atp.sprior_n_prgs - 1
+        and not atp.use_fa
+        and atp.bs > 1
+    )
+    if not ok:
+        return 1
+    n = min(atp.bs, _D_TILED_STITCH_BYTES // max(1, bytes_per_batch))
+    return n if n >= 2 else 1
+
+
+def _stitch_k_active_d_tiled_group(k_grp, bufs, atp, cfg, btc, i_b0, n_b, fa_tile_s_prior):
+    """Write K_active of n_b batches into the d-tiled group K buffer with one copy per d-tile.
+
+    k_grp is [d_tile_size, n_b * n_d_tiles * fa_tile_s_prior]. Batch g, d-tile i_d starts at column
+    (g * n_d_tiles + i_d) * fa_tile_s_prior. With s_active == 1 the active token is the last column of
+    that segment (block slot p_max - 1 of the last fold, in-block position block_len - 1).
+    bufs.k_active_sb is [d_tile_size, n_d_tiles * bs_full]; d-tile i_d starts at column i_d * bs_full.
+    """
+    b0 = btc.global_batch_offset + i_b0
+    seg = atp.n_d_tiles * fa_tile_s_prior
+    for i_d in range(atp.n_d_tiles):
+        col = i_d * fa_tile_s_prior + fa_tile_s_prior - 1
+        dst = (k_grp).reshape_dim(1, [n_b, seg]).slice(2, start=col, end=col + 1)
+        k_off = i_d * atp.bs_full * cfg.s_active + b0
+        src = (bufs.k_active_sb).slice(1, start=k_off, end=k_off + n_b).expand_dim(2)
+        nisa.tensor_copy(dst=dst, src=src)
+
+
+def _stitch_v_active_d_tiled_group(v_grp, bufs, atp, cfg, TC, btc, i_b0, n_b, fa_tile_n_sprior):
+    """Write V_active of n_b batches into the group V buffer with one DMA.
+
+    v_grp is [p_max, n_b * fa_tile_n_sprior * d_head]. With s_active == 1 the active row of batch g is
+    partition p_max - 1, s_prior tile fa_tile_n_sprior - 1 (last fold, in-block position block_len - 1).
+    """
+    dst = (
+        (v_grp)
+        .slice(0, start=TC.p_max - 1, end=TC.p_max)
+        .reshape_dim(1, [n_b, fa_tile_n_sprior, cfg.d_head])
+        .select(2, fa_tile_n_sprior - 1)
+    )
+    b0 = btc.global_batch_offset + i_b0
+    src = (bufs.v_active_reshaped).slice(0, start=b0, end=b0 + n_b).expand_dim(0)
+    nisa.dma_copy(dst=dst, src=src, name=f"v_active_d_tiled_group_b{i_b0}_bt{btc.batch_tile_idx}")
 
 
 def _stitch_k_active_swap(
