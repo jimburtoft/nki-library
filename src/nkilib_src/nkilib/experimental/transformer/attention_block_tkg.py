@@ -162,6 +162,7 @@ def attention_block_tkg(
     seq_packed_seq_id_table: Optional[nl.NkiTensor] = None,
     seq_packed_accumulator_partial_route_table: Optional[nl.NkiTensor] = None,
     seq_packed_accumulator_group_state_route_table: Optional[nl.NkiTensor] = None,
+    q_scale: Optional[nl.NkiTensor] = None,
 ):
     """
     Fused Attention Block for Token Generation (TKG).
@@ -278,6 +279,10 @@ def attention_block_tkg(
             scatter each row's slot partials into sequence groups. Must be supplied with the group-state route.
         seq_packed_accumulator_group_state_route_table (Optional[nl.NkiTensor]): Tensor Indirection routes that
             gather and scatter each group's persistent sequence state. Must be supplied with the partial route.
+        q_scale (Optional[nl.NkiTensor]): [B, S_tkg] @ HBM, float32 per-token query scale applied after
+            RoPE together with softmax_scale (e.g. the Llama 4 attention temperature
+            ``1 + beta * log(1 + floor(pos / original_max))``). None = no per-token scale.
+            Requires d_head <= 128 and no KVDP / CP / sequence-packed attention.
         softmax_scale (Optional[float]): Scaling factor for attention scores. If None, defaults to (1/√D) / k_scale.
             When using FP8 KV cache (k_scale/v_scale provided) and softmax_scale is None, the kernel automatically
             divides by k_scale to dequantize the KV cache values in the QK matmul, effectively setting
@@ -532,6 +537,17 @@ def attention_block_tkg(
         kernel_assert(CP_replica_group is not None, "CP_replica_group is required when CP > 1")
     I = d_head * (q_heads + 2 * kv_heads)
 
+    if q_scale != None:
+        kernel_assert(
+            not is_KVDP and not is_CP and not use_seq_packed_attention,
+            "q_scale is not supported with KVDP, CP or sequence-packed attention",
+        )
+        kernel_assert(d_head <= nl.tile_size.pmax, f"q_scale requires d_head <= {nl.tile_size.pmax}, got {d_head}")
+        kernel_assert(
+            tuple(q_scale.shape) == (B, S_tkg),
+            f"q_scale must be [B, S_tkg] = {(B, S_tkg)}, got {tuple(q_scale.shape)}",
+        )
+
     # d_head > pmax: in-kernel output projection is not supported (output_projection_tkg requires
     # D <= 128). Callers must pass W_out=None and apply the output projection externally, consuming
     # the returned per-head attention output [B, q_heads, d_head, S]. Attention/QKV/KV for d>128 are
@@ -766,6 +782,10 @@ def attention_block_tkg(
             )
         else:
             nisa.tensor_scalar(dst=Q_tkg_sb, data=Q_tkg_sb, op0=nl.multiply, operand0=_softmax_scale)
+
+        # Per-token query scale: Q column (b, h, s) *= q_scale[b, s] for every head h.
+        if q_scale != None:
+            _apply_per_token_q_scale(Q_tkg_sb, q_scale, B_attn, q_heads_attn, S_tkg, d_head, sbm)
 
         # Fold kv_heads into the batch dimension for attention_tkg (which supports a single KV head).
         # Heads [h*q_per_group : (h+1)*q_per_group] belong to KV head h.
@@ -1585,6 +1605,29 @@ def _to_sbuf(buf: nl.NkiTensor, sbm: SbufManager) -> nl.NkiTensor:
         sb = sbm.alloc_stack(buf.shape, dtype=buf.dtype, buffer=nl.sbuf)
         nisa.dma_copy(sb, buf)
         return sb
+
+
+def _apply_per_token_q_scale(
+    Q_sb: nl.NkiTensor,
+    q_scale: nl.NkiTensor,
+    B: int,
+    q_heads: int,
+    S_tkg: int,
+    d_head: int,
+    sbm: SbufManager,
+) -> None:
+    """
+    Multiply Q in place by a per-token scale shared by all heads.
+
+    Q_sb: [d_head, B*q_heads*S_tkg] @ SBUF, columns ordered (b, h, s).
+    q_scale: [B, S_tkg] @ HBM (float32). It is loaded once, broadcast over the d_head
+    partitions, and multiplied into Q with the head axis broadcast.
+    """
+    scale_sb = sbm.alloc_stack((d_head, B * S_tkg), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(scale_sb, q_scale.reshape((1, B * S_tkg)).broadcast(dim=0, size=d_head))
+    scale_b = scale_sb.reshape((d_head, B, S_tkg)).expand_dim(2).broadcast(2, q_heads)
+    Q_4d = Q_sb.reshape((d_head, B, q_heads, S_tkg))
+    nisa.tensor_tensor(Q_4d, Q_4d, scale_b, nl.multiply)
 
 
 def _rope_d_tiled_spanning(
