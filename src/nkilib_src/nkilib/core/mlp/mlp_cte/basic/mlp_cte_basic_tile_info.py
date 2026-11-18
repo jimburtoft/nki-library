@@ -509,7 +509,27 @@ def calc_peak_footprint(
         ),
     )
 
+    # Row-quantized gate/up weight scales ([pmax, I] fp32 each) are heap-allocated for the
+    # whole shard, after the BxS tile size is chosen, so they are live at every point above.
+    footprint += calc_row_weight_scales_footprint(mlp_params)
+
     return footprint
+
+
+def calc_row_weight_scales_footprint(mlp_params: MLPParameters) -> int:
+    """SBUF footprint of the row-quantized gate/up weight scales, which stay resident for the whole shard.
+
+    Args:
+        mlp_params: MLP configuration parameters
+
+    Returns:
+        Footprint in bytes per partition. Zero unless the weights are row-quantized; one scale
+        tensor when the gate projection is skipped, two otherwise.
+    """
+    if not mlp_params.quant_params.is_logical_quant_row():
+        return 0
+    scale_tensor_count = 1 if mlp_params.skip_gate_proj else 2
+    return footprint_B((nl.tile_size.pmax, mlp_params.intermediate_size), nl.float32) * scale_tensor_count
 
 
 def calc_sbuf_bound_bxs_tile_size(
