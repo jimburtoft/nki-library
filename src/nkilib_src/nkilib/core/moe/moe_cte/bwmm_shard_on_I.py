@@ -62,6 +62,8 @@ DOWN_SCALE_DMA_BCAST = _DOWN_SCALE_DMA_BCAST
 # one broadcast DMA, instead of one small DMA per 128-row I tile / 512-wide PSUM tile. NKILIB_FP8_SCALE_COALESCE=0
 # restores the per-tile loads.
 _FP8_SCALE_COALESCE = os.environ.get("NKILIB_FP8_SCALE_COALESCE", "1") != "0"
+# Coalesced per-channel FP8 gate/up scale load also when the last I tile is partial. NKILIB_FP8_SCALE_TAIL=0 disables.
+_FP8_SCALE_TAIL = os.environ.get("NKILIB_FP8_SCALE_TAIL", "1") != "0"
 FP8_SCALE_COALESCE = _FP8_SCALE_COALESCE
 # Down-proj bias: broadcast the [1, H] row to all partitions with one DMA instead of Vector stream shuffles.
 # Applies to BF16 and FP8. NKILIB_DOWN_BIAS_DMA_BCAST=0 restores the shuffles.
@@ -1025,8 +1027,45 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
             # Per-channel quant: scale shape [E, 1, 2*I_TP]
             gate_up_proj_scale_reshaped = inps.gate_up_proj_scale.reshape((dims.E, 2, dims.I_TP))
             _gu_coalesce = _FP8_SCALE_COALESCE and dims.I_TP_sharded == TILE_SIZE * dims.GUP_N_TILES
+            # Partial last I tile (I_TP_sharded % 128 != 0, e.g. 448 = 3 x 128 + 64): one DMA for the full tiles plus
+            # one for the tail, instead of the per-tile DMA loop, which neuronx-cc rejects inside the hybrid dynamic
+            # block loop (NCC_IGCA108 "loop-carried dependency").
+            _n_full = dims.I_TP_sharded // TILE_SIZE
+            _tail = dims.I_TP_sharded - _n_full * TILE_SIZE
+            _gu_coalesce_tail = (
+                _FP8_SCALE_COALESCE and not _gu_coalesce and _tail > 0 and _n_full + 1 == dims.GUP_N_TILES
+                and _FP8_SCALE_TAIL
+            )
             gup_scale = []
-            if _gu_coalesce:
+            if _gu_coalesce_tail:
+                gup_scale_tile = nl.ndarray((TILE_SIZE, 2 * dims.GUP_N_TILES), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.memset(dst=gup_scale_tile, value=0.0)
+                if _n_full > 0:
+                    nisa.dma_copy(
+                        dst=gup_scale_tile[0:TILE_SIZE, 0 : 2 * _n_full],
+                        src=gate_up_proj_scale_reshaped.ap(
+                            pattern=[[1, TILE_SIZE], [TILE_SIZE, _n_full], [dims.I_TP, 2]],
+                            offset=shard_id * dims.I_TP_sharded,
+                            scalar_offset=block_expert,
+                            indirect_dim=0,
+                        ),
+                        oob_mode=nisa.oob_mode.error,
+                    )
+                nisa.dma_copy(
+                    dst=gup_scale_tile[0:_tail, 2 * _n_full : 2 * _n_full + 2],
+                    src=gate_up_proj_scale_reshaped.ap(
+                        pattern=[[1, _tail], [dims.I_TP, 2]],
+                        offset=shard_id * dims.I_TP_sharded + _n_full * TILE_SIZE,
+                        scalar_offset=block_expert,
+                        indirect_dim=0,
+                    ),
+                    oob_mode=nisa.oob_mode.error,
+                )
+                for t in range(dims.GUP_N_TILES):
+                    gup_scale.append(
+                        [gup_scale_tile[0:TILE_SIZE, 2 * t : 2 * t + 1], gup_scale_tile[0:TILE_SIZE, 2 * t + 1 : 2 * t + 2]]
+                    )
+            elif _gu_coalesce:
                 # One DMA: tile[p, 2 * t + g] = scale[expert, g, shard_offset + 128 * t + p]
                 gup_scale_tile = nl.ndarray((TILE_SIZE, 2 * dims.GUP_N_TILES), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.dma_copy(
@@ -1050,7 +1089,7 @@ def compute_one_block(block_idx, dims: DimensionSizes, inps: InputTensors, outs:
                         tmp.append(nl.ndarray((TILE_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf))
                     gup_scale.append(tmp)
 
-            for gup_tile_idx in range(dims.GUP_N_TILES if not _gu_coalesce else 0):
+            for gup_tile_idx in range(dims.GUP_N_TILES if not (_gu_coalesce or _gu_coalesce_tail) else 0):
                 for gate_or_up in range(2):
                     if cfg.skip_gate_proj and gate_or_up == 0:
                         continue
