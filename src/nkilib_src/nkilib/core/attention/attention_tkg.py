@@ -408,6 +408,8 @@ def attention_tkg(
 
     # Row-tiling needs Q replicated across all partition halves; both MM1 paths then read bufs.q_sb.
     _replicate_q_for_row_tiling(bufs, atp, cfg, TC, sbm)
+    if atp.fp8_dpair:
+        _split_q_by_d_parity(bufs, atp, cfg, TC, sbm)
 
     # Compute batch tiling parameters
     _, batch_tile_size = uses_batch_tiling(
@@ -782,6 +784,10 @@ class AttnTileParams(nl.NKIObject):
 
     # DMA transpose optimization flag
     use_dma_transpose: bool = None
+    fp8_dpair: bool = False
+    """Unpacked 1-byte fp8 block K loaded through the bf16 dma_transpose gather as d-pairs: SBUF K is
+    [d_head // 2, s_prior] bf16, partition p holding fp8 d = (2p, 2p + 1). QK contracts the two parities
+    as two 64-row matmuls accumulated in PSUM against an even/odd-split Q (bufs.q_sb_dpair)."""
     """Whether to use indirect DMA transpose for block KV loading (the batched path that reshapes
     k_prior into 4-d tiles). True when d_head<=128 and dtype is 2 bytes. When False (d_head>128,
     FP8 without fp8_packed, or 1-byte dtype), block KV uses nc_transpose and flat KV non-FP8
@@ -966,6 +972,8 @@ class AttnInternalBuffers(nl.NKIObject):
     """Query tensor in SBUF after optional RoPE. Shape [AttnTKGConfig.d_head, AttnTileParams.bs_full * AttnTileParams.s_active_qh]. Scaled by 1/sqrt(AttnTKGConfig.d_head) if fuse_rope."""
 
     k_active_sb: nl.NkiTensor = None
+    q_sb_dpair: nl.NkiTensor = None
+    """fp8_dpair only: Q split by d parity, [d_head // 2, 2 * bs_full * s_active_qh] (even-d block, then odd-d)."""
     """Active key tensor in SBUF after optional RoPE. Shape [AttnTKGConfig.d_head, AttnTileParams.bs_full * AttnTKGConfig.s_active]."""
 
     pos_ids_sb: nl.NkiTensor = None
@@ -1273,6 +1281,21 @@ def _compute_tile_params(
     atp.use_dma_transpose = (
         (sizeinbytes(atp.k_prior_load_type) == 2) and (not atp.is_fp8_kv or cfg.fp8_packed) and cfg.d_head <= 128
     )  # use_dma_transpose may be further disabled in _setup_block_kv_cache for small block_len configs
+    # Unpacked fp8 block KV: load K as bf16 d-pairs through the dma_transpose gather (instead of the PE
+    # transpose path). Non-swap MM1, d_head == p_max, unfused rope only. NKILIB_ATTN_TKG_FP8_DPAIR=0 disables.
+    import os as _os
+
+    atp.fp8_dpair = bool(
+        atp.is_fp8_kv
+        and not cfg.fp8_packed
+        and cfg.d_head == TC.p_max
+        and cfg.block_len > 0
+        and not cfg.fuse_rope
+        and cfg.qk_in_sb
+        and _os.environ.get("NKILIB_ATTN_TKG_FP8_DPAIR", "1") != "0"
+    )
+    if atp.fp8_dpair:
+        atp.use_dma_transpose = True
     atp.io_type = q.dtype
     atp.inter_type = nl.float32
     atp.bs_full = cfg.bs
@@ -1491,6 +1514,7 @@ def _setup_block_kv_cache(
     if not cfg.fp8_packed:
         if (block_len < 8) or (block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2):
             atp.use_dma_transpose = False
+            atp.fp8_dpair = False
 
     # assign to atp (can't do directly because function return value cannot be assigned to object)
     atp.block_len = block_len
@@ -2210,6 +2234,31 @@ def _replicate_q_for_row_tiling(bufs, atp, cfg, TC, sbm):
     bufs.q_sb = q_sb_row_tile
 
 
+def _split_q_by_d_parity(bufs, atp, cfg, TC, sbm):
+    """fp8_dpair: bufs.q_sb_dpair[j, par * BQ + c] = q_sb[2j + par, c] (BQ = bs_full * s_active_qh).
+
+    Uses a 128 x 64 stride-2 slice of the identity as the stationary of one matmul per parity: Q[d, c] with
+    stationary I[d, par::2] gives out[j, c] = Q[2j + par, c]. Exact for bf16 Q (one non-zero term, fp32 PSUM).
+    """
+    half = cfg.d_head // 2
+    bq = atp.bs_full * atp.s_active_qh
+    bufs.q_sb_dpair = sbm.alloc_stack((half, 2 * bq), dtype=bufs.q_sb.dtype, buffer=nl.sbuf)
+    ident = nl.shared_identity_matrix(cfg.d_head, dtype=bufs.q_sb.dtype)
+    ident_sb = sbm.alloc_stack((cfg.d_head, cfg.d_head), dtype=bufs.q_sb.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=ident_sb, src=ident)
+    chunk = TC.psum_f_max  # columns per matmul (one PSUM bank of fp32)
+    for par in range(2):
+        for c0 in range(0, bq, chunk):
+            n = min(chunk, bq - c0)
+            ps = nl.ndarray((half, chunk), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(
+                ps[:, :n],
+                stationary=ident_sb[:, par : cfg.d_head : 2],
+                moving=bufs.q_sb[0 : cfg.d_head, c0 : c0 + n],
+            )
+            nisa.tensor_copy(dst=bufs.q_sb_dpair[:, par * bq + c0 : par * bq + c0 + n], src=ps[:, :n])
+
+
 """
 Main computation blocks
 """
@@ -2279,6 +2328,13 @@ def _compute_qk_matmul(
             k_prior_4d = k_prior_bf16.reshape(
                 (bufs.k_prior_reshaped.shape[0], 1, k_block_len_row_tiled, cfg.d_head * atp.qk_row_tile_factor)
             )
+        elif atp.fp8_dpair:
+            # Unpacked fp8 [N, block_len * d] viewed as bf16 [N, block_len * d / 2]: each bf16 lane is a d-pair.
+            k_block_len_dma = atp.block_len
+            k_block_len_row_tiled = k_block_len_dma
+            k_prior_4d = bufs.k_prior_reshaped.view(nl.bfloat16).reshape(
+                (bufs.k_prior_reshaped.shape[0], 1, k_block_len_row_tiled, cfg.d_head // 2)
+            )
         else:
             k_block_len_dma = atp.block_len
             k_block_len_row_tiled = k_block_len_dma // atp.qk_row_tile_factor
@@ -2313,8 +2369,11 @@ def _compute_qk_matmul(
             if (i_b % k_dma_batch_n_batches) == 0:
                 _k_sb_free_per_batch = num_folds_this_tile * k_block_len_row_tiled * TC.p_max
                 k_sb_shared = sbm.alloc_stack(
-                    (cfg.d_head * atp.qk_row_tile_factor, _k_sb_free_per_batch * k_dma_batch_n_batches),
-                    dtype=nl.bfloat16 if cfg.fp8_packed else _k_sb_dtype,
+                    (
+                        cfg.d_head // 2 if atp.fp8_dpair else cfg.d_head * atp.qk_row_tile_factor,
+                        _k_sb_free_per_batch * k_dma_batch_n_batches,
+                    ),
+                    dtype=nl.bfloat16 if (cfg.fp8_packed or atp.fp8_dpair) else _k_sb_dtype,
                     buffer=nl.sbuf,
                     align=32,
                 )
@@ -2325,6 +2384,13 @@ def _compute_qk_matmul(
             _k_sb_free_size = num_folds_this_tile * k_block_len_row_tiled * TC.p_max
             k_sb = sbm.alloc_stack(
                 (cfg.d_head * atp.qk_row_tile_factor, _k_sb_free_size),
+                dtype=nl.bfloat16,
+                buffer=nl.sbuf,
+                align=32,
+            )
+        elif atp.use_dma_transpose and atp.fp8_dpair:
+            k_sb = sbm.alloc_stack(
+                (cfg.d_head // 2, num_folds_this_tile * k_block_len_row_tiled * TC.p_max),
                 dtype=nl.bfloat16,
                 buffer=nl.sbuf,
                 align=32,
@@ -2369,6 +2435,8 @@ def _compute_qk_matmul(
 
                     k_dma_batch_size = k_dma_batch_n_folds * k_dma_batch_n_batches
                     idx_start = i_b * num_folds_this_tile + i_fold_rel
+                    # bf16 lanes per K row: d_head / 2 (fp8 d-pairs), else d_head * qk_row_tile_factor.
+                    k_row_w = cfg.d_head // 2 if atp.fp8_dpair else cfg.d_head * atp.qk_row_tile_factor
 
                     blks_u32 = (bufs.active_blocks_sb_u32).slice(
                         dim=1, start=idx_start, end=idx_start + k_dma_batch_size
@@ -2388,12 +2456,12 @@ def _compute_qk_matmul(
                         src=k_prior_4d.ap(
                             [
                                 [
-                                    k_block_len_row_tiled * cfg.d_head * atp.qk_row_tile_factor,
+                                    k_block_len_row_tiled * k_row_w,
                                     TC.p_max * k_dma_batch_size,
                                 ],
                                 [1, 1],
-                                [cfg.d_head * atp.qk_row_tile_factor, k_block_len_row_tiled],
-                                [1, cfg.d_head * atp.qk_row_tile_factor],
+                                [k_row_w, k_block_len_row_tiled],
+                                [1, k_row_w],
                             ],
                             offset=0,
                             vector_offset=blks_u32,
@@ -2610,6 +2678,7 @@ def _compute_qk_matmul(
 
         # For fp8_packed, create the fp8 reinterpreted view once outside the matmul loop
         k_sb_fp8 = (k_sb).view(_k_sb_dtype) if cfg.fp8_packed else None
+        k_sb_fp8_dp = (k_sb).view(_k_sb_dtype) if atp.fp8_dpair else None
 
         # d_head=64: replicate Q to 128 partitions for row-tiled MM1
         # Use cross_partition_copy (nc_stream_shuffle) for cross-partition data movement
@@ -2688,6 +2757,20 @@ def _compute_qk_matmul(
                         )
                         phys_start = phys_tile * 2 * TC.p_max + parity
                         k_tile = k_sb_fp8.slice(1, start=phys_start, end=phys_start + (num_acc - 1) * 2 + 1, step=2)
+                    elif atp.fp8_dpair:
+                        # d-pair path: k_sb bf16 [d/2, s_prior]; fp8 view [d/2, 2 * s_prior] holds (2p, 2p+1).
+                        phys_tile = _k_tile_physical_index(
+                            logical_tile_idx,
+                            k_block_len_row_tiled,
+                            k_dma_batch_n_folds,
+                            k_dma_batch_n_batches,
+                            i_b,
+                        )
+                        c0 = phys_tile * TC.p_max
+                        k_tile = None
+                        k_tile_par = [
+                            k_sb_fp8_dp[:, 2 * c0 + par : 2 * (c0 + num_acc) - 1 + par : 2] for par in range(2)
+                        ]
                     elif atp.use_dma_transpose:
                         # DMA transpose path: k_sb has shape [d_head * qk_row_tile_factor, s_prior]
                         phys_tile = _k_tile_physical_index(
@@ -2726,8 +2809,19 @@ def _compute_qk_matmul(
                         .select(1, i_mm1)
                         .slice(0, start=0, end=num_acc)
                     )
+                    if atp.fp8_dpair:
+                        # Two 64-row contractions (even d, odd d) accumulated in PSUM.
+                        q_dp_view = (
+                            bufs.q_sb_dpair.reshape_dim(1, [2, atp.bs_full, atp.s_active_qh])
+                        )
+                        for par in range(2):
+                            nisa.nc_matmul(
+                                qk_psum_view,
+                                stationary=k_tile_par[par],
+                                moving=q_dp_view[:, par, btc.global_batch_offset + i_b, :],
+                            )
                     # Accumulate across d_head tiles: each d_tile contributes to the same PSUM output
-                    for i_d in range(atp.n_d_tiles):
+                    for i_d in range(0 if atp.fp8_dpair else atp.n_d_tiles):
                         if i_d > 0:
                             k_sb_offset = i_d * fa_tile_s_prior + k_tile_offset
                             k_tile = k_sb[0 : atp.d_tile_size, nl.ds(k_sb_offset, num_acc)]
@@ -5593,7 +5687,35 @@ def _stitch_k_active(
             f"got num_blks_covering_s_active={num_blks_covering_s_active}.",
         )
 
-        if cfg.fp8_packed:
+        if atp.fp8_dpair:
+            # d-pair layout: k_sb bf16 [d/2, n_cols]; fp8 view element (p, 2 * col + par) = K[d = 2p + par].
+            # k_active_sb is [d, bs_full * s_active] fp8 (d on partitions); write each parity's rows
+            # with a stride-2 partition read of k_active (tensor_copy reads partitions par, par + 2, ...).
+            k_sb_dp = k_sb.view(_k_sb_dtype)  # [d/2, 2 * n_cols]
+            n_cols = k_sb.shape[1]
+            k_sb_dp_3d = k_sb_dp.reshape_dim(1, [n_cols, 2])  # [d/2, n_cols, 2]
+            k_active_batch = (
+                (bufs.k_active_sb).reshape_dim(1, [atp.bs_full, cfg.s_active]).select(1, btc.global_batch_offset + i_b)
+            )
+            last_fold_idx = num_folds_this_tile - 1
+            first_block_partition = TC.p_max - num_blks_covering_s_active
+            half = cfg.d_head // 2
+            for i_active in range(cfg.s_active):
+                pos_in_blocks = extra_covered + i_active
+                blk_idx = pos_in_blocks // atp.block_len
+                seq_in_blk = pos_in_blocks % atp.block_len
+                partition_idx = first_block_partition + blk_idx
+                logical_col = last_fold_idx * k_block_len_row_tiled + seq_in_blk
+                phys = _k_tile_physical_index(
+                    logical_col, k_block_len_row_tiled, k_dma_batch_n_folds, k_dma_batch_n_batches, i_b
+                )
+                col = phys * TC.p_max + partition_idx
+                for par in range(2):
+                    nisa.tensor_copy(
+                        dst=k_sb_dp_3d[:, col : col + 1, par : par + 1].reshape((half, 1)),
+                        src=k_active_batch[par : cfg.d_head : 2, i_active : i_active + 1],
+                    )
+        elif cfg.fp8_packed:
             # fp8_packed k_active stitching:
             # k_sb is bf16 [d_head*qk_row_tile_factor, num_folds*kblp*p_max]. Reinterpret as fp8 to get
             # [d_head*qk_row_tile_factor, num_folds*kblp*p_max*2] with interleaved even/odd layout.
