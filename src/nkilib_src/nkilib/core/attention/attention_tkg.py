@@ -973,6 +973,8 @@ class AttnInternalBuffers(nl.NKIObject):
 
     k_active_sb: nl.NkiTensor = None
     q_sb_dpair: nl.NkiTensor = None
+    k_active_dpair: nl.NkiTensor = None
+    """fp8_dpair only: k_active split by d parity, [d_head // 2, 2 * bs_full * s_active] (fp8)."""
     """fp8_dpair only: Q split by d parity, [d_head // 2, 2 * bs_full * s_active_qh] (even-d block, then odd-d)."""
     """Active key tensor in SBUF after optional RoPE. Shape [AttnTKGConfig.d_head, AttnTileParams.bs_full * AttnTKGConfig.s_active]."""
 
@@ -2234,29 +2236,38 @@ def _replicate_q_for_row_tiling(bufs, atp, cfg, TC, sbm):
     bufs.q_sb = q_sb_row_tile
 
 
-def _split_q_by_d_parity(bufs, atp, cfg, TC, sbm):
-    """fp8_dpair: bufs.q_sb_dpair[j, par * BQ + c] = q_sb[2j + par, c] (BQ = bs_full * s_active_qh).
+def _split_by_d_parity(src, n_cols, d_head, TC, sbm):
+    """Return [d_head // 2, 2 * n_cols] with out[j, par * n_cols + c] = src[2j + par, c] (src: [d_head, n_cols]).
 
-    Uses a 128 x 64 stride-2 slice of the identity as the stationary of one matmul per parity: Q[d, c] with
-    stationary I[d, par::2] gives out[j, c] = Q[2j + par, c]. Exact for bf16 Q (one non-zero term, fp32 PSUM).
+    One matmul per parity and column chunk, with a d x d/2 stride-2 slice of the identity as stationary
+    (only free-dim strides, so it lowers on hardware). Exact (one non-zero term per output, fp32 PSUM).
     """
-    half = cfg.d_head // 2
-    bq = atp.bs_full * atp.s_active_qh
-    bufs.q_sb_dpair = sbm.alloc_stack((half, 2 * bq), dtype=bufs.q_sb.dtype, buffer=nl.sbuf)
-    ident = nl.shared_identity_matrix(cfg.d_head, dtype=bufs.q_sb.dtype)
-    ident_sb = sbm.alloc_stack((cfg.d_head, cfg.d_head), dtype=bufs.q_sb.dtype, buffer=nl.sbuf)
+    half = d_head // 2
+    out = sbm.alloc_stack((half, 2 * n_cols), dtype=src.dtype, buffer=nl.sbuf)
+    mm_dtype = nl.bfloat16
+    ident = nl.shared_identity_matrix(d_head, dtype=mm_dtype)
+    ident_sb = sbm.alloc_stack((d_head, d_head), dtype=mm_dtype, buffer=nl.sbuf)
     nisa.tensor_copy(dst=ident_sb, src=ident)
+    if src.dtype != mm_dtype:
+        src_mm = sbm.alloc_stack((d_head, n_cols), dtype=mm_dtype, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=src_mm, src=src[0:d_head, 0:n_cols])
+    else:
+        src_mm = src
     chunk = TC.psum_f_max  # columns per matmul (one PSUM bank of fp32)
     for par in range(2):
-        for c0 in range(0, bq, chunk):
-            n = min(chunk, bq - c0)
+        for c0 in range(0, n_cols, chunk):
+            n = min(chunk, n_cols - c0)
             ps = nl.ndarray((half, chunk), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(
-                ps[:, :n],
-                stationary=ident_sb[:, par : cfg.d_head : 2],
-                moving=bufs.q_sb[0 : cfg.d_head, c0 : c0 + n],
-            )
-            nisa.tensor_copy(dst=bufs.q_sb_dpair[:, par * bq + c0 : par * bq + c0 + n], src=ps[:, :n])
+            nisa.nc_matmul(ps[:, :n], stationary=ident_sb[:, par:d_head:2], moving=src_mm[0:d_head, c0 : c0 + n])
+            nisa.tensor_copy(dst=out[:, par * n_cols + c0 : par * n_cols + c0 + n], src=ps[:, :n])
+    return out
+
+
+def _split_q_by_d_parity(bufs, atp, cfg, TC, sbm):
+    """fp8_dpair: Q and k_active split by d parity once per call (see _split_by_d_parity)."""
+    bq = atp.bs_full * atp.s_active_qh
+    bufs.q_sb_dpair = _split_by_d_parity(bufs.q_sb, bq, cfg.d_head, TC, sbm)
+    bufs.k_active_dpair = _split_by_d_parity(bufs.k_active_sb, atp.bs_full * cfg.s_active, cfg.d_head, TC, sbm)
 
 
 """
@@ -5694,9 +5705,7 @@ def _stitch_k_active(
             k_sb_dp = k_sb.view(_k_sb_dtype)  # [d/2, 2 * n_cols]
             n_cols = k_sb.shape[1]
             k_sb_dp_3d = k_sb_dp.reshape_dim(1, [n_cols, 2])  # [d/2, n_cols, 2]
-            k_active_batch = (
-                (bufs.k_active_sb).reshape_dim(1, [atp.bs_full, cfg.s_active]).select(1, btc.global_batch_offset + i_b)
-            )
+            k_active_dp = (bufs.k_active_dpair).reshape_dim(1, [2, atp.bs_full, cfg.s_active])
             last_fold_idx = num_folds_this_tile - 1
             first_block_partition = TC.p_max - num_blks_covering_s_active
             half = cfg.d_head // 2
@@ -5713,7 +5722,7 @@ def _stitch_k_active(
                 for par in range(2):
                     nisa.tensor_copy(
                         dst=k_sb_dp_3d[:, col : col + 1, par : par + 1].reshape((half, 1)),
-                        src=k_active_batch[par : cfg.d_head : 2, i_active : i_active + 1],
+                        src=k_active_dp[:, par, btc.global_batch_offset + i_b, i_active : i_active + 1],
                     )
         elif cfg.fp8_packed:
             # fp8_packed k_active stitching:
