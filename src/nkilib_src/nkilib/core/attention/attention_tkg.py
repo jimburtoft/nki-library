@@ -2947,8 +2947,9 @@ def _compute_kq_matmul_and_max_swapped(
     all_groups_full = fa_ctx.tile_s_prior % mm1_grp_sz == 0
     n_mm1_grps_total = div_ceil(fa_ctx.tile_s_prior, mm1_grp_sz)
     # cap: tunable value for the maximum number of positions per indirect dma_transpose
+    k_gather_cap = 64
     mm1_grps_per_k_tile, n_k_tiles = _compute_k_tile_gather(
-        n_mm1_grps_total, k_block_len_row_tile, n_pos_per_mm1_grp, batches_per_psum, all_groups_full, cap=64
+        n_mm1_grps_total, k_block_len_row_tile, n_pos_per_mm1_grp, batches_per_psum, all_groups_full, cap=k_gather_cap
     )
 
     sbm.open_scope(interleave_degree=batch_interleave_degree_safe, name="qk_matmul")
@@ -2984,28 +2985,35 @@ def _compute_kq_matmul_and_max_swapped(
                 load_n_pos = min(pos_end, fold_base + k_block_len_row_tile) - load_start
                 src_pos_in_fold = load_start - fold_base  # HBM read offset within the fold's block
                 dst_pos_in_tile = load_start - pos_start  # write offset within k_sb
-                blks_u32 = bufs.active_blocks_sb_u32_fold_major[
-                    :,
-                    (first_fold + i_load) * atp.bs + bsq_tile_batch_start : (first_fold + i_load) * atp.bs
-                    + bsq_tile_batch_start
-                    + batches_per_psum,
-                ]
-                nisa.dma_transpose(
-                    dst=k_sb_4d[:, 0:1, dst_pos_in_tile : dst_pos_in_tile + load_n_pos, :],
-                    src=k_prior_4d.ap(
-                        [
-                            [k_block_len_row_tile * k_d_head_row_tile, TC.p_max * batches_per_psum],
-                            [1, 1],
-                            [k_d_head_row_tile, load_n_pos],
-                            [1, k_d_head_row_tile],
+                # A gather moves load_n_pos positions for a run of batches. Keep each dma_transpose within
+                # k_gather_cap (positions x batches): with small s_active_qh (many batches per PSUM tile) one
+                # mm1 group alone can exceed it, so split the batches into equal chunks.
+                n_b_per_gather = _swap_k_gather_batch_chunk(batches_per_psum, load_n_pos, k_gather_cap)
+                for i_bc in range(batches_per_psum // n_b_per_gather):
+                    b_off = i_bc * n_b_per_gather
+                    col0 = (first_fold + i_load) * atp.bs + bsq_tile_batch_start + b_off
+                    blks_u32 = bufs.active_blocks_sb_u32_fold_major[:, col0 : col0 + n_b_per_gather]
+                    nisa.dma_transpose(
+                        dst=k_sb_4d[
+                            :,
+                            0:1,
+                            dst_pos_in_tile : dst_pos_in_tile + load_n_pos,
+                            b_off * TC.p_max : (b_off + n_b_per_gather) * TC.p_max,
                         ],
-                        offset=src_pos_in_fold * k_d_head_row_tile,
-                        vector_offset=blks_u32,
-                        indirect_dim=0,
-                    ),
-                    axes=(3, 1, 2, 0),
-                    dge_mode=nisa.dge_mode.swdge,
-                )
+                        src=k_prior_4d.ap(
+                            [
+                                [k_block_len_row_tile * k_d_head_row_tile, TC.p_max * n_b_per_gather],
+                                [1, 1],
+                                [k_d_head_row_tile, load_n_pos],
+                                [1, k_d_head_row_tile],
+                            ],
+                            offset=src_pos_in_fold * k_d_head_row_tile,
+                            vector_offset=blks_u32,
+                            indirect_dim=0,
+                        ),
+                        axes=(3, 1, 2, 0),
+                        dge_mode=nisa.dge_mode.swdge,
+                    )
 
             # On the final NC + last FA tile, stitch each batch's K_active onto the end of its K.
             last_fold_pos_start = (num_folds_this_tile - 1) * k_block_len_row_tile
@@ -5912,6 +5920,22 @@ def _compute_dma_batch_params(
     return batch_n_folds, batch_n_batches
 
 
+def _swap_k_gather_batch_chunk(batches_per_psum: int, n_pos: int, cap: int) -> int:
+    """Batches per swap K-gather dma_transpose: the largest divisor of batches_per_psum with
+    n_pos * batches <= cap (at least 1).
+
+    Example:
+        >>> _swap_k_gather_batch_chunk(32, 4, 64)
+        16
+        >>> _swap_k_gather_batch_chunk(16, 2, 64)
+        16
+    """
+    for nb in range(batches_per_psum, 0, -1):
+        if batches_per_psum % nb == 0 and nb * n_pos <= cap:
+            return nb
+    return 1
+
+
 def _compute_k_tile_gather(
     n_mm1_grps_total: int,
     pos_per_fold: int,
@@ -5934,8 +5958,8 @@ def _compute_k_tile_gather(
         ceil(n_pos_per_mm1_grp / pos_per_fold) folds, each a separate dma_transpose.
 
     A partial last mm1 group (SWA) makes groups within a k_tile unequal, so fall back to one group per
-    k_tile. is_qk_swapped gates out small s_active_qh (<= 4), so one group always fits the cap and the
-    size is always >= 1.
+    k_tile. With small s_active_qh one group can exceed the cap; the gather then splits the batches
+    (_swap_k_gather_batch_chunk). The size is always >= 1.
 
     Returns (mm1_grps_per_k_tile, n_k_tiles).
     """

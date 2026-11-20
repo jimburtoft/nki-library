@@ -394,9 +394,9 @@ def is_qk_swapped(
     # Q tiling not yet supported.
     if s_active_qh > p_max:
         return False
-    # Small s_active_qh (<= 4) not supported: the swap MM1 K-load would gather too many batches per
-    # dma_transpose to fit the DGE cap, and cannot be sub-divided below one mm1 group.
-    if s_active_qh <= 4:
+    # s_active_qh < 4 not evaluated. At s_active_qh == 4 (GQA with 4 Q heads per KV head at S=1) one mm1
+    # group spans 32 batches; the swap K-gather splits them into chunks within the DGE cap.
+    if s_active_qh < 4:
         return False
     # s_active_qh must column-tile into (a whole number of, or a whole fraction of) a 32-wide tile.
     if not (s_active_qh % 32 == 0 or 32 % s_active_qh == 0):
