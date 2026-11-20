@@ -2947,7 +2947,9 @@ def _compute_kq_matmul_and_max_swapped(
     all_groups_full = fa_ctx.tile_s_prior % mm1_grp_sz == 0
     n_mm1_grps_total = div_ceil(fa_ctx.tile_s_prior, mm1_grp_sz)
     # cap: tunable value for the maximum number of positions per indirect dma_transpose
-    k_gather_cap = 64
+    import os as _os
+
+    k_gather_cap = int(_os.environ.get("NKILIB_ATTN_TKG_SWAP_GATHER_CAP", "64"))
     mm1_grps_per_k_tile, n_k_tiles = _compute_k_tile_gather(
         n_mm1_grps_total, k_block_len_row_tile, n_pos_per_mm1_grp, batches_per_psum, all_groups_full, cap=k_gather_cap
     )
