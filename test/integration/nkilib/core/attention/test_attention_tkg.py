@@ -1035,6 +1035,12 @@ attention_tkg_fast_configs = [
     pytest.param(AttnTKGConfig(4, 1, 1, 1024, 1024, 128, 0, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(), marks=pytest.mark.fast),
     pytest.param(AttnTKGConfig(128, 1, 1, 1024, 1024, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=False, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(), marks=pytest.mark.fast),
 
+    # Block KV, bf16, many batches per core with a small resized block_len (s_prior 1536 -> block_len < 8):
+    # keeps the DMA transpose K load instead of the PE-transpose fallback.
+    pytest.param(AttnTKGConfig(64, 1, 1, 1536, 1536, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(), marks=pytest.mark.fast),
+    pytest.param(AttnTKGConfig(128, 1, 1, 1536, 1536, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(), marks=pytest.mark.fast),
+    pytest.param(AttnTKGConfig(128, 1, 1, 1536, 1536, 128, 16, tp_k_prior=True, strided_mm1=False, use_pos_id=True, qk_in_sb=True, k_out_in_sb=False, out_in_sb=False), AttnTKGTestParams(), marks=pytest.mark.fast),
+
     #################### SWA (Sliding Window Attention) Tests ####################
     # SWA requires use_pos_id=True, sliding_window > 0
     # Flat KV strided

@@ -63,6 +63,11 @@ _MAX_FLOAT32 = float(np.finfo(np.float32).max)
 # to the output.
 INACTIVE_BLOCK_IDX = np.int32(-1)
 
+# Resized block_len in [_DMA_TRANSPOSE_MIN_BLOCK_LEN, 8) keeps the DMA-transpose K load from this per-core
+# (head-folded) batch on; below either bound the PE-transpose fallback is faster.
+_DMA_TRANSPOSE_SMALL_BLOCK_MIN_BS = 16
+_DMA_TRANSPOSE_MIN_BLOCK_LEN = 4
+
 
 @nki.jit
 def attention_tkg(
@@ -1487,9 +1492,14 @@ def _setup_block_kv_cache(
     # Disable dma_transpose when block_len is very small, or block_len, d_head, and batches per core are all small on LNC2.
     # For these configs the DMA transpose overhead outweighs the benefits because there are too few batches to pipeline DMA bursts
     # and small block_len leads to too many folds per batch.
+    # With block_len 4-7 and enough (folded) batches per core the DMA bursts pipeline across batches and beat
+    # the PE-transpose fallback (indirect load + nc_transpose + PSUM->SBUF copies).
     # fp8_packed always uses DMA transpose (no PE transpose fallback for packed layout).
     if not cfg.fp8_packed:
-        if (block_len < 8) or (block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2):
+        small_block = block_len < _DMA_TRANSPOSE_MIN_BLOCK_LEN or (
+            block_len < 8 and atp.bs < _DMA_TRANSPOSE_SMALL_BLOCK_MIN_BS
+        )
+        if small_block or (block_len <= 16 and cfg.d_head <= 16 and atp.bs < 4 and atp.n_prgs == 2):
             atp.use_dma_transpose = False
 
     # assign to atp (can't do directly because function return value cannot be assigned to object)
