@@ -2967,15 +2967,23 @@ def _compute_kq_matmul_and_max_swapped(
             k_tile_mm1_grps = min(mm1_grps_per_k_tile, n_mm1_grps_total - k_tile_mm1_grp_start)
             pos_start = k_tile_mm1_grp_start * n_pos_per_mm1_grp
             k_tile_n_pos = min(k_tile_mm1_grps * n_pos_per_mm1_grp, n_pos_total - pos_start)
-            k_sb = sbm.alloc_stack(
-                (k_d_head_row_tile, k_tile_n_pos * batches_per_psum * TC.p_max),
-                dtype=nl.bfloat16 if cfg.fp8_packed else _k_sb_dtype,
-                buffer=nl.sbuf,
-                align=32,
-            )
-            k_sb_4d = k_sb.reshape((k_d_head_row_tile, 1, k_tile_n_pos, batches_per_psum * TC.p_max))
             # This k_tile's flat position window over the FA tile: [pos_start, pos_end).
             pos_end = pos_start + k_tile_n_pos
+            # K is staged in n_bchunks separate buffers of nbc batches each, so the QK of a chunk depends only on
+            # that chunk's gather and later gathers overlap earlier chunks' QK. nbc keeps every gather of this
+            # k_tile (at most min(k_tile_n_pos, fold) positions x nbc batches) within the DGE cap.
+            nbc = _swap_k_gather_batch_chunk(batches_per_psum, min(k_tile_n_pos, k_block_len_row_tile), k_gather_cap)
+            n_bchunks = batches_per_psum // nbc
+            k_sb_chunks = []
+            for _i_c in range(n_bchunks):
+                k_sb_chunks.append(
+                    sbm.alloc_stack(
+                        (k_d_head_row_tile, k_tile_n_pos * nbc * TC.p_max),
+                        dtype=nl.bfloat16 if cfg.fp8_packed else _k_sb_dtype,
+                        buffer=nl.sbuf,
+                        align=32,
+                    )
+                )
 
             # Load via multiple dma_transpose calls if loading across many folds.
             first_fold = pos_start // k_block_len_row_tile
@@ -2990,18 +2998,14 @@ def _compute_kq_matmul_and_max_swapped(
                 # A gather moves load_n_pos positions for a run of batches. Keep each dma_transpose within
                 # k_gather_cap (positions x batches): with small s_active_qh (many batches per PSUM tile) one
                 # mm1 group alone can exceed it, so split the batches into equal chunks.
-                n_b_per_gather = _swap_k_gather_batch_chunk(batches_per_psum, load_n_pos, k_gather_cap)
-                for i_bc in range(batches_per_psum // n_b_per_gather):
+                n_b_per_gather = nbc
+                for i_bc in range(n_bchunks):
                     b_off = i_bc * n_b_per_gather
                     col0 = (first_fold + i_load) * atp.bs + bsq_tile_batch_start + b_off
                     blks_u32 = bufs.active_blocks_sb_u32_fold_major[:, col0 : col0 + n_b_per_gather]
+                    k_sb_c4d = k_sb_chunks[i_bc].reshape((k_d_head_row_tile, 1, k_tile_n_pos, nbc * TC.p_max))
                     nisa.dma_transpose(
-                        dst=k_sb_4d[
-                            :,
-                            0:1,
-                            dst_pos_in_tile : dst_pos_in_tile + load_n_pos,
-                            b_off * TC.p_max : (b_off + n_b_per_gather) * TC.p_max,
-                        ],
+                        dst=k_sb_c4d[:, 0:1, dst_pos_in_tile : dst_pos_in_tile + load_n_pos, :],
                         src=k_prior_4d.ap(
                             [
                                 [k_block_len_row_tile * k_d_head_row_tile, TC.p_max * n_b_per_gather],
@@ -3030,20 +3034,21 @@ def _compute_kq_matmul_and_max_swapped(
                 last_fold_base_in_k_tile = max(0, last_fold_pos_start - pos_start)
                 # NOTE: loading happens at a k_tile granularity that can be smaller than a fold, so the last
                 # fold may span multiple k_tiles; the stitch runs once per k_tile overlapping it.
-                _stitch_k_active_swap(
-                    k_sb,
-                    bufs,
-                    atp,
-                    cfg,
-                    TC,
-                    btc,
-                    i_bsq_tile * batches_per_psum,
-                    batches_per_psum,
-                    k_tile_pos_in_last_fold,
-                    n_pos_in_last_fold,
-                    last_fold_base_in_k_tile,
-                    _k_sb_dtype,
-                )
+                for i_bc in range(n_bchunks):
+                    _stitch_k_active_swap(
+                        k_sb_chunks[i_bc],
+                        bufs,
+                        atp,
+                        cfg,
+                        TC,
+                        btc,
+                        i_bsq_tile * batches_per_psum + i_bc * nbc,
+                        nbc,
+                        k_tile_pos_in_last_fold,
+                        n_pos_in_last_fold,
+                        last_fold_base_in_k_tile,
+                        _k_sb_dtype,
+                    )
 
             # For each mm1 group in the k_tile: KQ^T into PSUM, then mask + max-reduce evict to bufs.qk.
             for i_mm1_grp_in_k_tile in range(k_tile_mm1_grps):
@@ -3099,21 +3104,22 @@ def _compute_kq_matmul_and_max_swapped(
                             fp8_pos_in_k_tile = mm1_grp_pos_in_k_tile  # already in bf16-slot (fp8-pair) units
                             # Un-permute the parity interleave of packed FP8 format
                             moving = (
-                                k_sb.view(_k_sb_dtype)
-                                .reshape((k_d_head_row_tile, k_tile_n_pos, batches_per_psum, TC.p_max, 2))[
+                                k_sb_chunks[i_b_local // nbc]
+                                .view(_k_sb_dtype)
+                                .reshape((k_d_head_row_tile, k_tile_n_pos, nbc, TC.p_max, 2))[
                                     row_slice,
                                     fp8_pos_in_k_tile : fp8_pos_in_k_tile + fp8_n_mm1_per_bank,
-                                    i_b_local,
+                                    i_b_local % nbc,
                                     :,
                                     :,
                                 ]
                                 .permute([0, 1, 3, 2])
                             )
                         else:
-                            moving = k_sb.reshape((k_d_head_row_tile, k_tile_n_pos, batches_per_psum, TC.p_max))[
+                            moving = k_sb_chunks[i_b_local // nbc].reshape((k_d_head_row_tile, k_tile_n_pos, nbc, TC.p_max))[
                                 row_slice,
                                 mm1_grp_pos_in_k_tile : mm1_grp_pos_in_k_tile + mm1_grp_n_mm1_per_bank,
-                                i_b_local,
+                                i_b_local % nbc,
                                 :,
                             ]
 
