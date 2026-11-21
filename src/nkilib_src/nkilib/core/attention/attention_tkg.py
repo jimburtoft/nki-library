@@ -785,6 +785,10 @@ class AttnTileParams(nl.NKIObject):
     # DMA transpose optimization flag
     use_dma_transpose: bool = None
     fp8_dpair: bool = False
+    fp8_dpair_double_row: bool = False
+    """fp8_dpair with QK as ONE double_row FP8 matmul (contraction 128 = 64 partitions x 2): K's d-pair lanes
+    are exactly the double_row operand layout. Q is cast to fp8 (q_sb_dr [64, 2, B * s_active_qh]).
+    NKILIB_ATTN_TKG_FP8_DPAIR=2 selects it; =1 keeps bf16 Q with two 64-row matmuls."""
     """Unpacked 1-byte fp8 block K loaded through the bf16 dma_transpose gather as d-pairs: SBUF K is
     [d_head // 2, s_prior] bf16, partition p holding fp8 d = (2p, 2p + 1). QK contracts the two parities
     as two 64-row matmuls accumulated in PSUM against an even/odd-split Q (bufs.q_sb_dpair)."""
@@ -973,6 +977,8 @@ class AttnInternalBuffers(nl.NKIObject):
 
     k_active_sb: nl.NkiTensor = None
     q_sb_dpair: nl.NkiTensor = None
+    q_sb_dr: nl.NkiTensor = None
+    """fp8_dpair_double_row only: fp8 Q as [d_head // 2, 2, bs_full * s_active_qh] (d = 2p + par)."""
     k_active_dpair: nl.NkiTensor = None
     """fp8_dpair only: k_active split by d parity, [d_head // 2, 2 * bs_full * s_active] (fp8)."""
     """fp8_dpair only: Q split by d parity, [d_head // 2, 2 * bs_full * s_active_qh] (even-d block, then odd-d)."""
@@ -1298,6 +1304,7 @@ def _compute_tile_params(
     )
     if atp.fp8_dpair:
         atp.use_dma_transpose = True
+        atp.fp8_dpair_double_row = _os.environ.get("NKILIB_ATTN_TKG_FP8_DPAIR", "1") == "2"
     atp.io_type = q.dtype
     atp.inter_type = nl.float32
     atp.bs_full = cfg.bs
@@ -2267,6 +2274,10 @@ def _split_q_by_d_parity(bufs, atp, cfg, TC, sbm):
     """fp8_dpair: Q and k_active split by d parity once per call (see _split_by_d_parity)."""
     bq = atp.bs_full * atp.s_active_qh
     bufs.q_sb_dpair = _split_by_d_parity(bufs.q_sb, bq, cfg.d_head, TC, sbm)
+    if atp.fp8_dpair_double_row:
+        bufs.q_sb_dr = sbm.alloc_stack((cfg.d_head // 2, 2, bq), dtype=atp.kv_e4m3_tile_dtype, buffer=nl.sbuf)
+        for par in range(2):
+            nisa.tensor_copy(dst=bufs.q_sb_dr[:, par, :], src=bufs.q_sb_dpair[:, par * bq : (par + 1) * bq])
     bufs.k_active_dpair = _split_by_d_parity(bufs.k_active_sb, atp.bs_full * cfg.s_active, cfg.d_head, TC, sbm)
 
 
@@ -2782,6 +2793,10 @@ def _compute_qk_matmul(
                         k_tile_par = [
                             k_sb_fp8_dp[:, 2 * c0 + par : 2 * (c0 + num_acc) - 1 + par : 2] for par in range(2)
                         ]
+                        # double_row stationary [64, 2, num_acc]: element (p, par, i) = K[2p + par] of column c0 + i
+                        k_tile_dr = (
+                            k_sb_fp8_dp.reshape_dim(1, [k_sb_fp8_dp.shape[1] // 2, 2])[:, c0 : c0 + num_acc, :]
+                        ).permute([0, 2, 1])
                     elif atp.use_dma_transpose:
                         # DMA transpose path: k_sb has shape [d_head * qk_row_tile_factor, s_prior]
                         phys_tile = _k_tile_physical_index(
@@ -2825,12 +2840,21 @@ def _compute_qk_matmul(
                         q_dp_view = (
                             bufs.q_sb_dpair.reshape_dim(1, [2, atp.bs_full, atp.s_active_qh])
                         )
-                        for par in range(2):
+                        if atp.fp8_dpair_double_row:
+                            q_b = btc.global_batch_offset + i_b
                             nisa.nc_matmul(
                                 qk_psum_view,
-                                stationary=k_tile_par[par],
-                                moving=q_dp_view[:, par, btc.global_batch_offset + i_b, :],
+                                stationary=k_tile_dr,
+                                moving=bufs.q_sb_dr[:, :, q_b * atp.s_active_qh : (q_b + 1) * atp.s_active_qh],
+                                perf_mode=nisa.matmul_perf_mode.double_row,
                             )
+                        else:
+                            for par in range(2):
+                                nisa.nc_matmul(
+                                    qk_psum_view,
+                                    stationary=k_tile_par[par],
+                                    moving=q_dp_view[:, par, btc.global_batch_offset + i_b, :],
+                                )
                     # Accumulate across d_head tiles: each d_tile contributes to the same PSUM output
                     for i_d in range(0 if atp.fp8_dpair else atp.n_d_tiles):
                         if i_d > 0:
