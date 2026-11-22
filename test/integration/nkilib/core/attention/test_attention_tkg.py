@@ -974,6 +974,10 @@ attention_tkg_fast_configs = [
     [AttnTKGConfig(1, 2, 5, 26624, 36896, 128, 32, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, enable_fa_s_prior_tiling=False), AttnTKGTestParams(fp8_kv=True)],
     # FP8 KV with Block KV large batch
     [AttnTKGConfig(128, 1, 1, 2048, 2048, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True), AttnTKGTestParams(fp8_kv=True)],
+    # FP8 KV (unpacked) with Block KV, d-pair dma_transpose K (CR 52): kv_heads=4 enables the default gate.
+    [AttnTKGConfig(128, 4, 1, 1024, 2048, 128, 32, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, kv_heads=4), AttnTKGTestParams(fp8_kv=True)],
+    [AttnTKGConfig(256, 4, 1, 1024, 2048, 128, 32, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, kv_heads=4), AttnTKGTestParams(fp8_kv=True)],
+    [AttnTKGConfig(32, 4, 1, 2048, 2048, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, kv_heads=4), AttnTKGTestParams(fp8_kv=True)],
     # FP8 KV with Block KV fp8_packed
     [AttnTKGConfig(4, 1, 5, 8192, 8192, 128, 16, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
     [AttnTKGConfig(8, 8, 5, 4096, 4096, 64, 32, tp_k_prior=True, strided_mm1=False, qk_in_sb=True, k_out_in_sb=True, out_in_sb=True, fp8_packed=True), AttnTKGTestParams(fp8_kv=True)],
