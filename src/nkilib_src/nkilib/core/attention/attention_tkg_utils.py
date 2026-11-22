@@ -96,6 +96,9 @@ class AttnTKGConfig(nl.NKIObject):
     out_in_sb: bool = False
     """Output attention tensor should remain in SBUF instead of being stored to HBM."""
 
+    kv_heads: int = 1
+    """KV heads folded into bs (bs = batch x kv_heads) by the caller. Only used for heuristics (fp8 d-pair K gate)."""
+
     enable_fa_s_prior_tiling: bool = True
     """Whether to enable Flash Attention (FA) with s_prior tiling.
     When enabled, tiles the attention computation across s_prior to reduce peak memory usage."""

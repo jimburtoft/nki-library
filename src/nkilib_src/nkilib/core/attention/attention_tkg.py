@@ -1290,21 +1290,32 @@ def _compute_tile_params(
         (sizeinbytes(atp.k_prior_load_type) == 2) and (not atp.is_fp8_kv or cfg.fp8_packed) and cfg.d_head <= 128
     )  # use_dma_transpose may be further disabled in _setup_block_kv_cache for small block_len configs
     # Unpacked fp8 block KV: load K as bf16 d-pairs through the dma_transpose gather (instead of the PE
-    # transpose path). Non-swap MM1, d_head == p_max, unfused rope only. NKILIB_ATTN_TKG_FP8_DPAIR=0 disables.
+    # transpose path). Non-swap MM1, d_head == p_max, unfused rope only.
+    # Default gate: kv_heads >= 4 per core. Measured on trn2 (Ministral-3-8B, ctx 1024): with 4 KV heads per core
+    # (TP2) it wins at every BS (-5 to -9 %); with 2 (TP4) it is mixed (BS32 +6 %, BS64 -9 %, BS128 +3 %).
+    # NKILIB_ATTN_TKG_FP8_DPAIR: 0 = off, 1 = force on, unset/"auto" = gated.
     import os as _os
 
-    atp.fp8_dpair = bool(
+    _dpair_env = _os.environ.get("NKILIB_ATTN_TKG_FP8_DPAIR", "auto")
+    _dpair_eligible = bool(
         atp.is_fp8_kv
         and not cfg.fp8_packed
         and cfg.d_head == TC.p_max
         and cfg.block_len > 0
         and not cfg.fuse_rope
         and cfg.qk_in_sb
-        and _os.environ.get("NKILIB_ATTN_TKG_FP8_DPAIR", "1") != "0"
     )
+    if _dpair_env == "0":
+        atp.fp8_dpair = False
+    elif _dpair_env in ("1", "2"):
+        atp.fp8_dpair = _dpair_eligible
+    else:
+        atp.fp8_dpair = _dpair_eligible and cfg.kv_heads >= 4
     if atp.fp8_dpair:
         atp.use_dma_transpose = True
-        atp.fp8_dpair_double_row = _os.environ.get("NKILIB_ATTN_TKG_FP8_DPAIR", "1") == "2"
+        # "2": double_row FP8 QK. Fails neuronx-cc ISA validation on trn2 (s3_lw_dual_fp8_restrictions); kept for
+        # reference only.
+        atp.fp8_dpair_double_row = _dpair_env == "2"
     atp.io_type = q.dtype
     atp.inter_type = nl.float32
     atp.bs_full = cfg.bs

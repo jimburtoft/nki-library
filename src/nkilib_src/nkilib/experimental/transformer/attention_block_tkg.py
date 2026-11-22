@@ -874,6 +874,7 @@ def attention_block_tkg(
             enable_fa_s_prior_tiling=enable_fa_s_prior_tiling,
             fp8_packed=fp8_packed,
             return_cp_softmax_stats=is_CP,
+            kv_heads=kv_heads,
         )
 
         # Allocate softmax stats output tensors for CP (compact tile layout, not broadcast)
