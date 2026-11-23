@@ -40,6 +40,7 @@ from .gdn_cte_utils import (
     build_mask_pack,
 )
 from .gdn_tkg import gdn_tkg
+from .gdn_tkg_grouped import gdn_tkg_grouped
 
 __all__ = [
     "ALGORITHM_NEUMANN",
@@ -54,4 +55,5 @@ __all__ = [
     "gdn_conv1d_prefill",
     "gdn_cte",
     "gdn_tkg",
+    "gdn_tkg_grouped",
 ]

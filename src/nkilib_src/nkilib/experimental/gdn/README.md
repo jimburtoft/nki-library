@@ -8,6 +8,7 @@ feeds them.
 |---|---|---|
 | `gdn_cte` | `gdn_cte.py` | Prefill. Dispatches to one of two intra-chunk inverse algorithms; **the family's only prefill entry point**. |
 | `gdn_tkg` | `gdn_tkg.py` | Single-token decode recurrence. |
+| `gdn_tkg_grouped` | `gdn_tkg_grouped.py` | Single-token decode recurrence, per-head work vectorized over the core's heads and the state streamed in groups (`gdn_tkg` contract, K = V = 128; for large batch x heads). |
 | `gdn_block_tkg` | `gdn_block_tkg.py` | Fused decode megakernel (in_proj + conv1d + GQA + recurrence). |
 | `gdn_conv1d_prefill` / `gdn_conv1d_decode` | `gdn_conv1d.py` | Short depthwise causal conv1d on the GDN input projection. |
 
