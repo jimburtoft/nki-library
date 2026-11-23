@@ -26,6 +26,9 @@ from ..utils.kernel_assert import kernel_assert
 from ..utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 from .cascaded_max_utils import predicated_folded_load, reduce
 
+# Added to non-max slots before the min-reduce: >= 2^24, above every valid index (< 128 stages x 16384 = 2^21).
+_NON_MAX_INDEX_OFFSET = float(2**24)
+
 
 @nki.jit
 def cascaded_max(input_tensor: nl.NkiTensor) -> Tuple[nl.NkiTensor, nl.NkiTensor]:
@@ -355,11 +358,20 @@ def _grouped_reduce_max(
     nisa.tensor_tensor(
         dst=mask,
         data1=input_tensor.reshape(reshaped_shape),
-        op=nl.equal,
+        op=nl.not_equal,
         data2=reduced_max.reshape((b, fold_factor, 1)).broadcast(2, elts_per_fold),
     )
-    nisa.tensor_tensor(dst=masked_index, data1=mask.reshape((b, n)), data2=index, op=nl.multiply)
-    nisa.tensor_reduce(dst=final_index, op=nl.maximum, data=masked_index.reshape(reshaped_shape), axis=2)
+    # masked_index = index + (x != max) * _NON_MAX_INDEX_OFFSET; its min per group is the lowest tied index
+    # (torch.argmax semantics, independent of the stage fold and so of B, S and the LNC degree).
+    nisa.scalar_tensor_tensor(
+        dst=masked_index,
+        data=mask.reshape((b, n)),
+        op0=nl.multiply,
+        operand0=_NON_MAX_INDEX_OFFSET,
+        op1=nl.add,
+        operand1=index,
+    )
+    nisa.tensor_reduce(dst=final_index, op=nl.minimum, data=masked_index.reshape(reshaped_shape), axis=2)
     return reduced_max, final_index
 
 
